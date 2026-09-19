@@ -1,0 +1,8 @@
+*.o
+*.elf
+*.7z
+.DS_Store
+build/
+dist/
+*.log
+*.result
