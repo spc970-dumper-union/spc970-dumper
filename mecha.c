@@ -309,6 +309,12 @@ int mecha_verify_nvram(const u8 *nvram_buf, ProgressCallback cb) {
     return mismatches;
 }
 
+void mecha_delay(int iterations) {
+    for (volatile int d = 0; d < iterations; d++) {
+        __asm__ volatile("" : : : "memory");
+    }
+}
+
 int mecha_read_ram_probe(u8 region, u8 block_count, u8 *out_buf, u8 *status) {
     if (!out_buf) return -1;
     u8 st = 0;
@@ -316,6 +322,7 @@ int mecha_read_ram_probe(u8 region, u8 block_count, u8 *out_buf, u8 *status) {
     if (status) *status = st;
     if (ret != 0 || st != 0x00) {
         mecha_close_config(&st);
+        mecha_delay(2000);
         return -1;
     }
 
@@ -325,10 +332,13 @@ int mecha_read_ram_probe(u8 region, u8 block_count, u8 *out_buf, u8 *status) {
         int r = mecha_read_config(&out_buf[b * 16], &blk_stat);
         if (r != 0 || blk_stat != 0x00) {
             errors++;
+            break; // Stop immediately to avoid hanging CDVD bus on closed/errored session
         }
+        mecha_delay(200);
     }
 
     mecha_close_config(&st);
+    mecha_delay(2000);
     return errors;
 }
 
@@ -339,6 +349,7 @@ int mecha_read_ram_probe_blocks(u8 region, u8 req_count, int blocks_to_read, u8 
     if (status) *status = st;
     if (ret != 0 || st != 0x00) {
         mecha_close_config(&st);
+        mecha_delay(2000);
         return -1;
     }
 
@@ -348,10 +359,13 @@ int mecha_read_ram_probe_blocks(u8 region, u8 req_count, int blocks_to_read, u8 
         int r = mecha_read_config(&out_buf[b * 16], &blk_stat);
         if (r != 0 || blk_stat != 0x00) {
             errors++;
+            break; // Stop immediately to avoid hanging CDVD bus on closed/errored session
         }
+        mecha_delay(200);
     }
 
     mecha_close_config(&st);
+    mecha_delay(2000);
     return errors;
 }
 
@@ -379,12 +393,6 @@ int mecha_write_config_raw(u8 *data16) {
     u8 out[16] = { 0 };
     int ret = sceCdApplySCmd(0x42, data16, 16, out);
     return (ret == 1 && out[0] == 0x00) ? 0 : -1;
-}
-
-static void mecha_delay(int iterations) {
-    for (volatile int d = 0; d < iterations; d++) {
-        __asm__ volatile("" : : : "memory");
-    }
 }
 
 u8 g_config_window[256] = { 0 };

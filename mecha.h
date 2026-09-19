@@ -91,6 +91,9 @@ int mecha_read_ram_probe(u8 region, u8 block_count, u8 *out_buf, u8 *status);
 // Flexible RAM probe: req_count passed to SCMD 0x40 (0 for underflow), blocks_to_read read via SCMD 0x41
 int mecha_read_ram_probe_blocks(u8 region, u8 req_count, int blocks_to_read, u8 *out_buf, u8 *status);
 
+// Safe delay loop
+void mecha_delay(int iterations);
+
 // Query any SCMD 0x03 PMAP subcommand (returns 16 bytes)
 int mecha_query_scmd03_subcmd(u8 subcmd, u8 *out16, u8 *status);
 

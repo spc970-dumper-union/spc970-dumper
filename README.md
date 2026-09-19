@@ -55,7 +55,7 @@ When using Mapping Mode (`--map` / Menu [6]):
 ├── REGION1_RAM256.BIN
 ├── REGION2_RAM256.BIN
 ├── MECHA_MAP_REPORT.TXT
-└── PMAP_SUBCMDS.TXT
+└── TARGET_SCMD_REPORT.TXT
 ```
 
 ---
