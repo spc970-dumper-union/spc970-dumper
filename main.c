@@ -252,18 +252,18 @@ static void query_initial_hardware(void) {
   log_printf("[INIT] SCMD 0x03-01: DSP Version = 0x%02X (status: 0x%02X)\n",
              g_dsp_ver, dsp_stat);
 
-  // 4. MechaCon Model Name (SCMD 0x17, offset 0 and offset 8)
+  // 4. MechaCon Model Name (SCMD 0x17, offset 0 and offset 8) - only exists on v2+
   u8 mn_stat = 0;
-  if (mecha_read_model_name(g_cdvd_model, &mn_stat) == 0 &&
+  if (g_mecha_ver[1] >= 2 && mecha_read_model_name(g_cdvd_model, &mn_stat) == 0 &&
       strlen(g_cdvd_model) > 0) {
     g_model_name_valid = 1;
     log_printf("[INIT] SCMD 0x17 Model Name: %s\n", g_cdvd_model);
   } else {
     g_model_name_valid = 0;
-    strcpy(g_cdvd_model, "N/A (Early MechaCon)");
+    strcpy(g_cdvd_model, "N/A (Early MechaCon v1)");
     log_printf(
-        "[INIT] SCMD 0x17 not present or returned error (stat: 0x%02X)\n",
-        mn_stat);
+        "[INIT] SCMD 0x17 skipped/not present on MechaCon v%d (stat: 0x%02X)\n",
+        g_mecha_ver[1], mn_stat);
   }
 
   // 5. Hardware RTC (SCMD 0x08)
@@ -897,8 +897,6 @@ static void full_hardware_mapping_action(void) {
     { "SCMD 0x08    (Hardware RTC)", 0x08, 0, { 0x00 }, 8 },
     { "SCMD 0x0A    (Read NVM w0)",  0x0A, 2, { 0x00, 0x00 }, 3 },
     { "SCMD 0x12    (i.Link ID)",    0x12, 0, { 0x00 }, 8 },
-    { "SCMD 0x17-00 (Model Name 0)", 0x17, 1, { 0x00 }, 9 },
-    { "SCMD 0x17-08 (Model Name 8)", 0x17, 1, { 0x08 }, 9 },
   };
   int num_target_cmds = sizeof(target_cmds) / sizeof(target_cmds[0]);
 
