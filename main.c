@@ -1424,7 +1424,7 @@ static void save_debug_log_action(void) {
 
 static void advanced_tools_menu(void) {
   int sub_selected = 0;
-  const int sub_items = 7;
+  const int sub_items = 6;
 
   while (1) {
     scr_clear();
@@ -1439,14 +1439,12 @@ static void advanced_tools_menu(void) {
                (sub_selected == 1) ? "->" : "  ");
     scr_printf(" %s [3] Config Overflow Quick Probe (Diagnostic)\n",
                (sub_selected == 2) ? "->" : "  ");
-    scr_printf(" %s [4] Full Hardware & RAM Mapping (All Regions)\n",
+    scr_printf(" %s [4] EEPROM Worker Discovery & Flush Diagnostics\n",
                (sub_selected == 3) ? "->" : "  ");
-    scr_printf(" %s [5] EEPROM Worker Discovery & Flush Diagnostics\n",
+    scr_printf(" %s [5] Export Debug Log to USB Storage\n",
                (sub_selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Export Debug Log to USB Storage\n",
+    scr_printf(" %s [6] Back to Main Menu\n\n",
                (sub_selected == 5) ? "->" : "  ");
-    scr_printf(" %s [7] Back to Main Menu\n\n",
-               (sub_selected == 6) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     scr_printf(" NVRAM State : %s\n",
@@ -1475,15 +1473,12 @@ static void advanced_tools_menu(void) {
         probe_config_overflow_action();
         break;
       case 3:
-        full_hardware_mapping_action();
-        break;
-      case 4:
         worker_flush_diagnostics_action();
         break;
-      case 5:
+      case 4:
         save_debug_log_action();
         break;
-      case 6:
+      case 5:
         return;
       }
     } else if (btn & PAD_TRIANGLE) {
@@ -1550,7 +1545,7 @@ int main(int argc, char *argv[]) {
   }
 
   int selected = 0;
-  const int menu_items = 4;
+  const int menu_items = 5;
 
   while (1) {
     scr_clear();
@@ -1574,12 +1569,16 @@ int main(int argc, char *argv[]) {
                (selected == 1) ? "->" : "  ");
     scr_printf("      -> View full console identity and save DEBUG_LOG.TXT to USB\n\n");
 
-    scr_printf(" %s [3] Advanced Tools & Manual Operations...\n",
+    scr_printf(" %s [3] Full Hardware & RAM Mapping (All Regions)\n",
                (selected == 2) ? "->" : "  ");
-    scr_printf("      -> Standalone NVRAM backup, restore, worker & RAM probes\n\n");
+    scr_printf("      -> Safe scan of Regions 0-7, RAM dumps & SCMD report\n\n");
 
-    scr_printf(" %s [4] Exit to OSD / Browser\n\n",
+    scr_printf(" %s [4] Advanced Tools & Manual Operations...\n",
                (selected == 3) ? "->" : "  ");
+    scr_printf("      -> Standalone NVRAM backup, restore, worker & flush probes\n\n");
+
+    scr_printf(" %s [5] Exit to OSD / Browser\n\n",
+               (selected == 4) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     if (g_storage_ready) {
@@ -1610,9 +1609,12 @@ int main(int argc, char *argv[]) {
         show_system_info();
         break;
       case 2:
-        advanced_tools_menu();
+        full_hardware_mapping_action();
         break;
       case 3:
+        advanced_tools_menu();
+        break;
+      case 4:
         return 0;
       }
     }
