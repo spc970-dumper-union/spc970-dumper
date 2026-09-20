@@ -6,13 +6,14 @@
 
 A specialized, safety-focused PlayStation 2 utility built with PS2SDK to dump the internal mask ROM of Sony **SPC970** MechaCon microcontrollers (Siemens/Infineon C166 core derivatives) to USB storage.
 
-Supports both **v2** (CXP102064, 256 KiB) and **v3** (CXP103049, 192 KiB) MechaCon revisions with automated layout detection, failsafe NVRAM restoration, and **100% POST hardware checksum verification**.
+Supports **v1** (CXP101064, 256 KiB), **v2** (CXP102064, 256 KiB), and **v3** (CXP103049, 192 KiB) MechaCon revisions with automated layout detection, failsafe NVRAM restoration, and **100% POST hardware checksum verification**.
 
 ---
 
 ## Features
 
 - **Multi-Revision ROM Dumper**:
+  - **MechaCon v1 (CXP101064)**: Supports early Sony PlayStation 2 models (SCPH-10000, SCPH-15000). Features dedicated early-worker exploit staging (`early-v1-v202-fields` layout at RAM `0x1A0C..0x1A28`), dynamic Block 12 checksum balancing, and busy-polling via SCMD 0x40. Dumps full 256 KiB ROM (`0xFC0000-0xFFFFFF`).
   - **MechaCon v2 (CXP102064)**: Dumps complete 256 KiB ROM (`0xFC0000-0xFFFFFF`, 4 banks: FC, FD, FE, FF).
   - **MechaCon v3 (CXP103049)**: Dumps native 192 KiB active ROM (`0xFD0000-0xFFFFFF`, 3 banks: FD, FE, FF). Automatically omits unmapped Bank FC, saving 256 exploit staging cycles (25% faster, 25% less EEPROM write wear).
 - **Failsafe Hardware Protection**:
@@ -20,6 +21,9 @@ Supports both **v2** (CXP102064, 256 KiB) and **v3** (CXP103049, 192 KiB) MechaC
   - Pre-flight staging verification: validates target ROM entry signature (`0xE600`) before proceeding.
   - Immediate auto-restoration of NVRAM if exploit staging or MechaCon session fails.
   - Word-by-word read-back verification of restored NVRAM with zero mismatch tolerance.
+- **EEPROM Worker Discovery & Flush Diagnostics** (`--flush` / Menu Option 6):
+  - Safely performs a non-destructive 4-block hardware-native write using the console's existing NVRAM data.
+  - Dumps baseline and post-flush RAM (`FLUSH_PRE_REG2.BIN`, `FLUSH_POST_REG2.BIN`) to observe MechaCon internal worker pointers and generate detailed differential telemetry (`WORKER_DISCOVERY.TXT`).
 - **POST Hardware Checksum Verification**:
   - Re-implements the exact hardware checksum calculation executed by the Sony MechaCon POST routine (`0xFF5170`).
   - Verifies the dual-mirror checksum table at `0xFFFB80` == `0xFFFB92`.
@@ -121,8 +125,12 @@ The build generates:
 
 The ELF can be launched from host loaders or automated test runners:
 
-- `host:test.elf --auto` : Automatically initiates Full Dump, validates POST checksums, restores NVRAM, and exits cleanly.
-- `host:test.elf --map`  : Automatically dumps all valid RAM regions and probes SCMD 0x03 subcommands.
+- `host:test.elf --auto`  : Automatically initiates Full Dump, validates POST checksums, restores NVRAM, and exits cleanly.
+- `host:test.elf --flush` : Performs safe EEPROM worker flush diagnostics and live RAM telemetry.
+- `host:test.elf --map`   : Automatically dumps all valid RAM regions and probes SCMD 0x03 subcommands.
+- `host:test.elf --ident` : Queries and displays console identity, BIOS ROMVER, MechaCon revision, and exits.
+- `host:test.elf --backup`: Performs non-destructive NVRAM backup and exits.
+- `host:test.elf --probe` : Tests SCMD 0x42 buffer overflow write acceptance and exits.
 
 ---
 

@@ -89,20 +89,34 @@ const char *get_model_id_desc(u16 model_id) {
 u32 extract_serial_from_nvram(const u8 *nvram, u8 *emcs_out) {
     if (!nvram) return 0;
 
-    // 1. Try Old layout (words 0x0E6, 0x0E7 -> offsets 0x1CC..0x1CF in big-endian dump)
-    u16 w0_old = (u16)((nvram[0x1CC] << 8) | nvram[0x1CD]);
-    u16 w1_old = (u16)((nvram[0x1CE] << 8) | nvram[0x1CF]);
-    if (w0_old != 0xFFFF && w1_old != 0xFFFF && (w0_old != 0 || w1_old != 0)) {
-        if (emcs_out) *emcs_out = (u8)((w1_old >> 8) & 0xFF);
-        return (u32)(w0_old | ((w1_old & 0xFF) << 16));
+    // 1. Try Old layout (words 0x0E6, 0x0E7 -> offsets 0x1CC..0x1CF)
+    // First try native little-endian:
+    u16 w0_le = (u16)(nvram[0x1CC] | (nvram[0x1CD] << 8));
+    u16 w1_le = (u16)(nvram[0x1CE] | (nvram[0x1CF] << 8));
+    if (w0_le != 0xFFFF && w1_le != 0xFFFF && (w0_le != 0 || w1_le != 0)) {
+        if (emcs_out) *emcs_out = (u8)((w1_le >> 8) & 0xFF);
+        return (u32)(w0_le | ((w1_le & 0xFF) << 16));
+    }
+    // Fallback: big-endian
+    u16 w0_be = (u16)((nvram[0x1CC] << 8) | nvram[0x1CD]);
+    u16 w1_be = (u16)((nvram[0x1CE] << 8) | nvram[0x1CF]);
+    if (w0_be != 0xFFFF && w1_be != 0xFFFF && (w0_be != 0 || w1_be != 0)) {
+        if (emcs_out) *emcs_out = (u8)((w1_be >> 8) & 0xFF);
+        return (u32)(w0_be | ((w1_be & 0xFF) << 16));
     }
 
-    // 2. Try New layout (words 0x0FA, 0x0FB -> offsets 0x1F4..0x1F7 in big-endian dump)
-    u16 w0_new = (u16)((nvram[0x1F4] << 8) | nvram[0x1F5]);
-    u16 w1_new = (u16)((nvram[0x1F6] << 8) | nvram[0x1F7]);
-    if (w0_new != 0xFFFF && w1_new != 0xFFFF && (w0_new != 0 || w1_new != 0)) {
-        if (emcs_out) *emcs_out = (u8)((w1_new >> 8) & 0xFF);
-        return (u32)(w0_new | ((w1_new & 0xFF) << 16));
+    // 2. Try New layout (words 0x0FA, 0x0FB -> offsets 0x1F4..0x1F7)
+    u16 w0_new_le = (u16)(nvram[0x1F4] | (nvram[0x1F5] << 8));
+    u16 w1_new_le = (u16)(nvram[0x1F6] | (nvram[0x1F7] << 8));
+    if (w0_new_le != 0xFFFF && w1_new_le != 0xFFFF && (w0_new_le != 0 || w1_new_le != 0)) {
+        if (emcs_out) *emcs_out = (u8)((w1_new_le >> 8) & 0xFF);
+        return (u32)(w0_new_le | ((w1_new_le & 0xFF) << 16));
+    }
+    u16 w0_new_be = (u16)((nvram[0x1F4] << 8) | nvram[0x1F5]);
+    u16 w1_new_be = (u16)((nvram[0x1F6] << 8) | nvram[0x1F7]);
+    if (w0_new_be != 0xFFFF && w1_new_be != 0xFFFF && (w0_new_be != 0 || w1_new_be != 0)) {
+        if (emcs_out) *emcs_out = (u8)((w1_new_be >> 8) & 0xFF);
+        return (u32)(w0_new_be | ((w1_new_be & 0xFF) << 16));
     }
 
     if (emcs_out) *emcs_out = 0;
@@ -113,12 +127,16 @@ u16 extract_model_id_from_nvram(const u8 *nvram) {
     if (!nvram) return 0;
 
     // Check old location: word 0x0E4 (offset 0x1C8..0x1C9)
-    u16 m_old = (u16)((nvram[0x1C8] << 8) | nvram[0x1C9]);
-    if (m_old != 0xFFFF && m_old != 0x0000) return m_old;
+    u16 m_old_le = (u16)(nvram[0x1C8] | (nvram[0x1C9] << 8));
+    if (m_old_le >= 0xD200 && m_old_le <= 0xD4FF) return m_old_le;
+    u16 m_old_be = (u16)((nvram[0x1C8] << 8) | nvram[0x1C9]);
+    if (m_old_be >= 0xD200 && m_old_be <= 0xD4FF) return m_old_be;
 
     // Check new location: word 0x0F8 (offset 0x1F0..0x1F1)
-    u16 m_new = (u16)((nvram[0x1F0] << 8) | nvram[0x1F1]);
-    if (m_new != 0xFFFF && m_new != 0x0000) return m_new;
+    u16 m_new_le = (u16)(nvram[0x1F0] | (nvram[0x1F1] << 8));
+    if (m_new_le >= 0xD200 && m_new_le <= 0xD4FF) return m_new_le;
+    u16 m_new_be = (u16)((nvram[0x1F0] << 8) | nvram[0x1F1]);
+    if (m_new_be >= 0xD200 && m_new_be <= 0xD4FF) return m_new_be;
 
     return 0;
 }

@@ -22,6 +22,8 @@
 #include "mecha.h"
 #include "verify.h"
 
+#define MECHA_TOOL_VERSION "v0.1.0-alpha"
+
 static char padBuf[256] __attribute__((aligned(64)));
 static u8 g_nvram_backup[NVRAM_SIZE_BYTES] = {0};
 static int g_nvram_backed_up = 0;
@@ -1253,7 +1255,143 @@ static void restore_nvram_action(void) {
   wait_for_cross();
 }
 
-// Menu 6: Save Debug Log to USB
+// Menu 6: EEPROM Worker Discovery & Flush Diagnostics
+static void worker_flush_diagnostics_action(void) {
+  scr_clear();
+  scr_printf("=====================================================\n");
+  scr_printf("   EEPROM Worker Discovery & Flush Diagnostics      \n");
+  scr_printf("=====================================================\n\n");
+
+  log_printf("[DISCOVERY] Worker flush discovery action initiated...\n");
+
+  // Step 1: Ensure NVRAM backup exists
+  if (!g_nvram_backed_up) {
+    scr_printf(" [*] Step 1/3: Backing up NVRAM first for safety...\n");
+    int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
+    g_nvram_backed_up = 1;
+    if (read_errs > 0) {
+      log_printf("[WARN] NVRAM backup had %d word errors\n", read_errs);
+    }
+    g_serial = extract_serial_from_nvram(g_nvram_backup, &g_emcs);
+    g_model_id = extract_model_id_from_nvram(g_nvram_backup);
+    update_dump_directory();
+
+    char nvram_path[256];
+    snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
+    int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd_nvm >= 0) {
+      write(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES);
+      close(fd_nvm);
+    }
+  } else {
+    scr_printf(" [*] Step 1/3: NVRAM is already safely backed up.\n");
+  }
+
+  update_dump_directory();
+
+  // Step 2: Region 2 Controlled Flush Test
+  scr_printf("\n [*] Step 2/3: Performing Region 2 (0x1940) Controlled Flush...\n");
+  scr_printf("     Writing 4 original blocks back to trigger internal worker...\n");
+
+  u8 pre_r2[256];
+  memset(pre_r2, 0, sizeof(pre_r2));
+  u8 post_r2[256];
+  memset(post_r2, 0, sizeof(post_r2));
+  struct worker_flush_diff diff_r2;
+  memset(&diff_r2, 0, sizeof(diff_r2));
+
+  int ret_r2 = mecha_worker_flush_probe(2, pre_r2, post_r2, &diff_r2);
+  if (ret_r2 == 0) {
+    scr_printf(" [+] Region 2 Flush Completed! Total RAM bytes changed: %d\n", diff_r2.total_changed_bytes);
+    scr_printf("     Overflow Area Changes (Blocks 8-15): %d bytes\n", diff_r2.overflow_changed_bytes);
+
+    if (diff_r2.flags_detected_offset > 0) {
+      scr_printf(" [!] WORKER FLAGS DETECTED AT RAM: 0x%04X!\n", diff_r2.flags_detected_offset);
+    }
+
+    // Save PRE and POST binaries
+    char pre_path[256], post_path[256];
+    snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG2.BIN", g_dump_dir);
+    snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG2.BIN", g_dump_dir);
+    int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, pre_r2, 256); close(fd); }
+    fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, post_r2, 256); close(fd); }
+  } else {
+    scr_printf(" [-] Region 2 Flush Probe failed with code %d\n", ret_r2);
+  }
+
+  // Step 3: Region 1 Controlled Flush Test
+  scr_printf("\n [*] Step 3/3: Performing Region 1 (0x18D0) Controlled Flush...\n");
+  u8 pre_r1[256];
+  memset(pre_r1, 0, sizeof(pre_r1));
+  u8 post_r1[256];
+  memset(post_r1, 0, sizeof(post_r1));
+  struct worker_flush_diff diff_r1;
+  memset(&diff_r1, 0, sizeof(diff_r1));
+
+  int ret_r1 = mecha_worker_flush_probe(1, pre_r1, post_r1, &diff_r1);
+  if (ret_r1 == 0) {
+    scr_printf(" [+] Region 1 Flush Completed! Total RAM bytes changed: %d\n", diff_r1.total_changed_bytes);
+    scr_printf("     Overflow Area Changes (Blocks 8-15): %d bytes\n", diff_r1.overflow_changed_bytes);
+
+    char pre_path[256], post_path[256];
+    snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG1.BIN", g_dump_dir);
+    snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG1.BIN", g_dump_dir);
+    int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, pre_r1, 256); close(fd); }
+    fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd >= 0) { write(fd, post_r1, 256); close(fd); }
+  } else {
+    scr_printf(" [-] Region 1 Flush Probe failed with code %d\n", ret_r1);
+  }
+
+  // Generate WORKER_DISCOVERY.TXT report
+  char rpt_path[256];
+  snprintf(rpt_path, sizeof(rpt_path), "%s/WORKER_DISCOVERY.TXT", g_dump_dir);
+  FILE *fr = fopen(rpt_path, "w");
+  if (fr) {
+    fprintf(fr, "=====================================================\n");
+    fprintf(fr, "      MechaCon EEPROM Worker Discovery Report        \n");
+    fprintf(fr, "=====================================================\n\n");
+    fprintf(fr, "MechaCon Chip Part No : %s\n", get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
+    fprintf(fr, "MechaCon Version      : MD 1.39 v%d.%02d (Region: 0x%02X, Rev 0x%02X)\n\n",
+            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], g_mecha_ver[3]);
+    fprintf(fr, "--- Region 2 Flush (Base: 0x1940) ---\n");
+    fprintf(fr, "Outcome         : %s\n", (ret_r2 == 0) ? "SUCCESS" : "FAILED");
+    fprintf(fr, "Total Changes   : %d bytes\n", diff_r2.total_changed_bytes);
+    fprintf(fr, "Overflow Changes: %d bytes (Blocks 8-15: 0x19C0-0x1A3F)\n", diff_r2.overflow_changed_bytes);
+    for (int i = 0; i < 256; i++) {
+      if (pre_r2[i] != post_r2[i]) {
+        fprintf(fr, "  RAM 0x%04X (blk %2d, byte %2d): 0x%02X -> 0x%02X\n",
+                0x1940 + i, i / 16, i % 16, pre_r2[i], post_r2[i]);
+      }
+    }
+
+    fprintf(fr, "\n--- Region 1 Flush (Base: 0x18D0) ---\n");
+    fprintf(fr, "Outcome         : %s\n", (ret_r1 == 0) ? "SUCCESS" : "FAILED");
+    fprintf(fr, "Total Changes   : %d bytes\n", diff_r1.total_changed_bytes);
+    fprintf(fr, "Overflow Changes: %d bytes\n", diff_r1.overflow_changed_bytes);
+    for (int i = 0; i < 256; i++) {
+      if (pre_r1[i] != post_r1[i]) {
+        fprintf(fr, "  RAM 0x%04X (blk %2d, byte %2d): 0x%02X -> 0x%02X\n",
+                0x18D0 + i, i / 16, i % 16, pre_r1[i], post_r1[i]);
+      }
+    }
+    fclose(fr);
+    scr_printf("\n [+] Telemetry report saved: %s\n", rpt_path);
+    log_printf("[DISCOVERY] Report saved to %s\n", rpt_path);
+  }
+
+  char log_path[256];
+  snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
+  log_save_to_file(log_path);
+
+  scr_printf(" [+] Flush discovery complete! All files saved to USB:\n    %s/\n", g_dump_dir);
+  wait_for_cross();
+}
+
+// Menu 7: Save Debug Log to USB
 static void save_debug_log_action(void) {
   scr_clear();
   scr_printf("=====================================================\n");
@@ -1277,6 +1415,71 @@ static void save_debug_log_action(void) {
   wait_for_cross();
 }
 
+static void advanced_tools_menu(void) {
+  int sub_selected = 0;
+  const int sub_items = 6;
+
+  while (1) {
+    scr_clear();
+    scr_printf("=====================================================\n");
+    scr_printf("        Advanced Tools & Manual Operations           \n");
+    scr_printf("=====================================================\n\n");
+    scr_printf(" D-Pad Up/Down: Navigate | CROSS (X): Select | TRIANGLE: Back\n\n");
+
+    scr_printf(" %s [1] Standalone NVRAM Backup (1024 Bytes)\n",
+               (sub_selected == 0) ? "->" : "  ");
+    scr_printf(" %s [2] Restore NVRAM from Backup Buffer\n",
+               (sub_selected == 1) ? "->" : "  ");
+    scr_printf(" %s [3] Config Overflow Quick Probe (Diagnostic)\n",
+               (sub_selected == 2) ? "->" : "  ");
+    scr_printf(" %s [4] Full Hardware & RAM Mapping (All Regions)\n",
+               (sub_selected == 3) ? "->" : "  ");
+    scr_printf(" %s [5] EEPROM Worker Discovery & Flush Diagnostics\n",
+               (sub_selected == 4) ? "->" : "  ");
+    scr_printf(" %s [6] Back to Main Menu\n\n",
+               (sub_selected == 5) ? "->" : "  ");
+
+    scr_printf("-----------------------------------------------------\n");
+    scr_printf(" NVRAM State : %s\n",
+               g_nvram_backed_up ? "[BACKED UP]" : "[NOT BACKED UP]");
+
+    u32 btn = 0;
+    while (!(btn = read_pad_click())) {
+      for (volatile int d = 0; d < 10000; d++)
+        ;
+    }
+
+    if (btn & PAD_UP) {
+      sub_selected = (sub_selected - 1 + sub_items) % sub_items;
+    } else if (btn & PAD_DOWN) {
+      sub_selected = (sub_selected + 1) % sub_items;
+    } else if (btn & PAD_CROSS) {
+      log_printf("[UI] User selected advanced menu item [%d]\n", sub_selected + 1);
+      switch (sub_selected) {
+      case 0:
+        backup_nvram_action();
+        break;
+      case 1:
+        restore_nvram_action();
+        break;
+      case 2:
+        probe_config_overflow_action();
+        break;
+      case 3:
+        full_hardware_mapping_action();
+        break;
+      case 4:
+        worker_flush_diagnostics_action();
+        break;
+      case 5:
+        return;
+      }
+    } else if (btn & PAD_TRIANGLE) {
+      return;
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   log_init();
   init_ps2_system();
@@ -1290,16 +1493,18 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (!argv[i])
       continue;
-    if (strcmp(argv[i], "--auto") == 0 || strcmp(argv[i], "--dump") == 0)
+    if (strcmp(argv[i], "--auto") == 0 || strcmp(argv[i], "--dump") == 0 || strcmp(argv[i], "--v1") == 0)
       auto_action = 4;
     else if (strcmp(argv[i], "--probe") == 0)
       auto_action = 3;
     else if (strcmp(argv[i], "--backup") == 0)
       auto_action = 2;
-    else if (strcmp(argv[i], "--info") == 0)
+    else if (strcmp(argv[i], "--info") == 0 || strcmp(argv[i], "--ident") == 0)
       auto_action = 1;
     else if (strcmp(argv[i], "--map") == 0)
       auto_action = 5;
+    else if (strcmp(argv[i], "--flush") == 0)
+      auto_action = 6;
   }
 
   if (auto_action > 0) {
@@ -1327,44 +1532,52 @@ int main(int argc, char *argv[]) {
   } else if (auto_action == 5) {
     full_hardware_mapping_action();
     return 0;
+  } else if (auto_action == 6) {
+    worker_flush_diagnostics_action();
+    return 0;
   }
 
   int selected = 0;
-  const int menu_items = 8;
+  const int menu_items = 5;
 
   while (1) {
     scr_clear();
     scr_printf("=====================================================\n");
-    scr_printf("    PS2 MechaCon Diagnostic & CXP103049 Dumper Tool  \n");
+    scr_printf("       PS2 MechaCon ROM Dumper %s           \n", MECHA_TOOL_VERSION);
     scr_printf("=====================================================\n");
     scr_printf(
-        " Chip: %-16s | Ver: v%d.%02d (Reg 0x%02X)\n\n",
+        " Chip   : %-16s | Firmware: v%d.%02d (Reg 0x%02X)\n",
         get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]),
         g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]);
+    scr_printf(" Console: %-16s | Target: %s/\n\n",
+               g_model_name_valid ? g_cdvd_model : get_model_id_desc(g_model_id),
+               g_dump_dir);
     scr_printf(" D-Pad Up/Down: Navigate | CROSS (X): Select\n\n");
 
-    scr_printf(" %s [1] Console & MechaCon Identification\n",
+    scr_printf(" %s [1] DUMP MECHACON ROM (Recommended)\n",
                (selected == 0) ? "->" : "  ");
-    scr_printf(" %s [2] Backup Full NVRAM (1024 Bytes)\n",
+    scr_printf("      -> Auto Exploit, POST Verify & NVRAM Safe Backup\n\n");
+
+    scr_printf(" %s [2] Hardware Diagnostics & System Telemetry\n",
                (selected == 1) ? "->" : "  ");
-    scr_printf(" %s [3] Quick Probe Config Overflow (Diagnostic)\n",
+    scr_printf("      -> View detailed hardware identity, registers & SCMD info\n\n");
+
+    scr_printf(" %s [3] Save Current Debug Log to USB\n",
                (selected == 2) ? "->" : "  ");
-    scr_printf(" %s [4] Full Hardware & RAM Mapping (All Regions & Safe SCMDs)\n",
+    scr_printf("      -> Export all execution telemetry to %s/\n\n", g_dump_dir);
+
+    scr_printf(" %s [4] Advanced Tools & Manual Operations...\n",
                (selected == 3) ? "->" : "  ");
-    scr_printf(" %s [5] Full Auto Dump, Checksums & Auto-Restore\n",
+    scr_printf("      -> Standalone NVRAM backup, restore, worker & RAM probes\n\n");
+
+    scr_printf(" %s [5] Exit to OSD / Browser\n\n",
                (selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Restore NVRAM from Backup Buffer\n",
-               (selected == 5) ? "->" : "  ");
-    scr_printf(" %s [7] Save Current Debug Log to USB\n",
-               (selected == 6) ? "->" : "  ");
-    scr_printf(" %s [8] Exit to OSD / Browser\n\n",
-               (selected == 7) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     if (g_storage_ready) {
-      scr_printf(" Target Path : %s/\n", g_dump_dir);
+      scr_printf(" Status: Ready to dump to %s/\n", g_dump_dir);
     } else {
-      scr_printf(" Target Path : %s/ [!] (Insert USB drive)\n", g_dump_dir);
+      scr_printf(" Status: %s/ [!] Insert USB flash drive (FAT32/exFAT)\n", g_dump_dir);
     }
     scr_printf(" NVRAM State : %s\n",
                g_nvram_backed_up ? "[BACKED UP]" : "[NOT BACKED UP]");
@@ -1383,27 +1596,18 @@ int main(int argc, char *argv[]) {
       log_printf("[UI] User selected menu item [%d]\n", selected + 1);
       switch (selected) {
       case 0:
-        show_system_info();
-        break;
-      case 1:
-        backup_nvram_action();
-        break;
-      case 2:
-        probe_config_overflow_action();
-        break;
-      case 3:
-        full_hardware_mapping_action();
-        break;
-      case 4:
         full_dump_and_verify_action();
         break;
-      case 5:
-        restore_nvram_action();
+      case 1:
+        show_system_info();
         break;
-      case 6:
+      case 2:
         save_debug_log_action();
         break;
-      case 7:
+      case 3:
+        advanced_tools_menu();
+        break;
+      case 4:
         return 0;
       }
     }

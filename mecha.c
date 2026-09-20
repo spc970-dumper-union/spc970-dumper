@@ -245,9 +245,9 @@ int mecha_backup_nvram(u8 *nvram_buf, ProgressCallback cb) {
             err_count++;
         }
 
-        // Store big-endian word to match standard NVRAM dumps
-        nvram_buf[w * 2]     = (u8)((word_val >> 8) & 0xFF);
-        nvram_buf[w * 2 + 1] = (u8)(word_val & 0xFF);
+        // Store little-endian word to match native hardware byte order
+        nvram_buf[w * 2]     = (u8)(word_val & 0xFF);
+        nvram_buf[w * 2 + 1] = (u8)((word_val >> 8) & 0xFF);
 
         if (cb && (w % 16 == 0 || w == NVRAM_SIZE_WORDS - 1)) {
             cb(w + 1, NVRAM_SIZE_WORDS, "Reading NVRAM words");
@@ -261,7 +261,7 @@ int mecha_restore_nvram(const u8 *nvram_buf, ProgressCallback cb) {
     int err_count = 0;
 
     for (int w = 0; w < NVRAM_SIZE_WORDS; w++) {
-        u16 word_val = (u16)((nvram_buf[w * 2] << 8) | nvram_buf[w * 2 + 1]);
+        u16 word_val = (u16)(nvram_buf[w * 2] | (nvram_buf[w * 2 + 1] << 8));
 
         // If EEPROM already has identical word, skip writing to save wear & avoid timeouts
         u16 curr_val = 0;
@@ -298,7 +298,7 @@ int mecha_verify_nvram(const u8 *nvram_buf, ProgressCallback cb) {
         u8 hi = (u8)((current_word >> 8) & 0xFF);
         u8 lo = (u8)(current_word & 0xFF);
 
-        if (nvram_buf[w * 2] != hi || nvram_buf[w * 2 + 1] != lo) {
+        if (nvram_buf[w * 2] != lo || nvram_buf[w * 2 + 1] != hi) {
             mismatches++;
         }
 
@@ -416,7 +416,7 @@ static const u8 shifted_worker_tail_signature[48] = {
     0x13, 0x01, 0x02, 0x09, 0xcc, 0x00, 0x01, 0x03
 };
 
-static const struct worker_layout known_worker_layouts[] = {
+static const struct worker_layout known_worker_layouts[WORKER_LAYOUT_COUNT] = {
     {
         .name = "standard-fields",
         .flags_block = 11, .flags_byte = 6,
@@ -456,6 +456,20 @@ static const struct worker_layout known_worker_layouts[] = {
         .marker_block = 11, .marker_byte = 5, .marker_value = 1,
         .layout_signature_salt = 0x31425948u,
         .tail_signature = shifted_worker_tail_signature
+    },
+    {
+        .name = "early-v1-v202-fields",
+        .flags_block = 12, .flags_byte = 12,
+        .source_pointer_offset = 14, .flags_mutable_end_byte = 15,
+        .control_block = 14, .source_offset_byte = 2,
+        .word_count_byte = 3, .worker_state_byte = 4,
+        .destination_block = 14, .destination_low_byte = 6,
+        .destination_high_byte = 7, .checksum_adjust_byte = 13,
+        .scratch_boundary_byte = 0,
+        .marker_block = 0xff,
+        .marker_byte = 0, .marker_value = 0,
+        .layout_signature_salt = 0x31303130u,
+        .tail_signature = NULL
     }
 };
 
@@ -481,11 +495,13 @@ static int worker_byte_is_mutable(const struct worker_layout *layout, int block,
 }
 
 static int worker_byte_is_volatile(const struct worker_layout *layout, int block, int byte) {
+    if (!layout->tail_signature) return 0;
     return (block == 13 && byte >= layout->scratch_boundary_byte) ||
            (block == 14 && byte < layout->scratch_boundary_byte);
 }
 
 static int worker_layout_matches(const struct worker_layout *layout) {
+    if (!layout->tail_signature) return 0;
     if (layout->marker_block != 0xFF &&
         g_config_window[layout->marker_block * 16 + layout->marker_byte] != layout->marker_value)
         return 0;
@@ -505,7 +521,7 @@ static int worker_layout_matches(const struct worker_layout *layout) {
 
 int mecha_detect_worker_layout(void) {
     int match_index = -1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < WORKER_LAYOUT_COUNT; i++) {
         if (worker_layout_matches(&known_worker_layouts[i])) {
             if (match_index != -1) {
                 match_index = -1; // Ambiguous
@@ -517,10 +533,17 @@ int mecha_detect_worker_layout(void) {
 
     if (match_index == -1) {
         // Safe fallback using firmware version
-        if (g_mecha_ver[1] >= 3 || (g_mecha_ver[1] == 2 && g_mecha_ver[2] >= 14)) {
-            match_index = 1;
+        // Layout 3 (early-v1-v202-fields) covers:
+        //   - Real v1.xx (CXP101064): g_mecha_ver[1] == 1
+        //   - v2.02 (early CXP102064): g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2
+        //     (no standard worker tail signature in RAM, so pattern match returned -1)
+        if (g_mecha_ver[1] == 1 ||
+            (g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2)) {
+            match_index = LAYOUT_V1_EARLY_V2; // 3
+        } else if (g_mecha_ver[1] >= 3 || (g_mecha_ver[1] == 2 && g_mecha_ver[2] >= 14)) {
+            match_index = LAYOUT_V3_MARKER_00; // 1
         } else {
-            match_index = 0;
+            match_index = LAYOUT_STANDARD_V2; // 0
         }
     }
 
@@ -531,7 +554,7 @@ int mecha_detect_worker_layout(void) {
 }
 
 const struct worker_layout *mecha_get_layout(int layout_index) {
-    if (layout_index < 0 || layout_index >= 3) return NULL;
+    if (layout_index < 0 || layout_index >= WORKER_LAYOUT_COUNT) return NULL;
     return &known_worker_layouts[layout_index];
 }
 
@@ -542,15 +565,32 @@ static void prepare_stage_block(int index, u32 rom_address, u16 nvram_word, int 
     if (index == 7) {
         // Guarantee 0x19B0.0 is preserved (system state flag)
         block[0] = 0xFF;
-        block[1] = 0x67;
+        if (block[1] == 0) block[1] = 0x67;
     }
 
     if (index == layout->flags_block) {
         block[layout->flags_byte] &= 0xFC; // Idle mask (clear bits 0 and 1)
-        block[layout->source_pointer_offset]     = (u8)(rom_address & 0xFF);
-        block[layout->source_pointer_offset + 1] = (u8)((rom_address >> 8) & 0xFF);
-        block[layout->source_pointer_offset + 2] = (u8)((rom_address >> 16) & 0xFF);
-        block[layout->source_pointer_offset + 3] = (u8)((rom_address >> 24) & 0xFF);
+        if (layout->source_pointer_offset <= 12) {
+            block[layout->source_pointer_offset]     = (u8)(rom_address & 0xFF);
+            block[layout->source_pointer_offset + 1] = (u8)((rom_address >> 8) & 0xFF);
+            block[layout->source_pointer_offset + 2] = (u8)((rom_address >> 16) & 0xFF);
+            block[layout->source_pointer_offset + 3] = (u8)((rom_address >> 24) & 0xFF);
+        } else {
+            // Pointer starts at byte 14 of Block 12, byte 15 is checksum byte of Block 12
+            block[layout->source_pointer_offset] = (u8)(rom_address & 0xFF);
+            if (layout->checksum_adjust_byte < 15) {
+                block[layout->checksum_adjust_byte] = 0;
+                u8 partial_sum = 0;
+                for (int i = 0; i < 15; i++) partial_sum += block[i];
+                block[layout->checksum_adjust_byte] = (u8)(((u8)((rom_address >> 8) & 0xFF)) - partial_sum);
+            }
+        }
+    }
+
+    if (layout->source_pointer_offset > 12 && index == (layout->flags_block + 1)) {
+        // High 16 bits of pointer in Block 13 (bytes 0-1)
+        block[0] = (u8)((rom_address >> 16) & 0xFF);
+        block[1] = (u8)((rom_address >> 24) & 0xFF);
     }
 
     if (index == layout->control_block) {
@@ -579,7 +619,7 @@ static void prepare_stage_block(int index, u32 rom_address, u16 nvram_word, int 
 }
 
 int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvram_word_count, int layout_mode) {
-    if (layout_mode < 0 || layout_mode >= 3) return -1;
+    if (layout_mode < 0 || layout_mode >= WORKER_LAYOUT_COUNT) return -1;
     const struct worker_layout *layout = &known_worker_layouts[layout_mode];
 
     u8 status = 0;
@@ -618,7 +658,7 @@ int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvr
         memcpy(block, &g_config_window[index * 16], 16);
         if (index == 7) {
             block[0] = 0xFF;
-            block[1] = 0x67;
+            if (block[1] == 0) block[1] = 0x67;
         }
         u8 sum = 0;
         for (int i = 0; i < 15; i++) sum += block[i];
@@ -635,6 +675,12 @@ int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvr
     // Trigger block: send flags_block with trigger bits (0x03) set
     memcpy(block, saved_flags_block, 16);
     block[layout->flags_byte] = (block[layout->flags_byte] & 0xFC) | 0x03;
+    if (layout->source_pointer_offset > 12 && layout->checksum_adjust_byte < 15) {
+        block[layout->checksum_adjust_byte] = 0;
+        u8 partial_sum = 0;
+        for (int i = 0; i < 15; i++) partial_sum += block[i];
+        block[layout->checksum_adjust_byte] = (u8)(((u8)((rom_source_addr >> 8) & 0xFF)) - partial_sum);
+    }
     u8 sum = 0;
     for (int i = 0; i < 15; i++) sum += block[i];
     block[15] = sum;
@@ -648,19 +694,24 @@ int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvr
     // Wait for worker to finish and close session (poll SCMD 0x43)
     int close_done = 0;
     for (int retry = 0; retry < 1000; retry++) {
-        u8 close_stat = 0;
+        u8 close_stat = 0xFF;
         mecha_close_config(&close_stat);
         if (close_stat == 0x00) {
             close_done = 1;
             break;
         }
-        mecha_delay(5000);
+        if (close_stat != 0x01) {
+            log_printf("[EXPLOIT] SCMD 0x43 close error: stat=0x%02X\n", close_stat);
+            break;
+        }
+        mecha_delay(5000); // 5ms per poll
     }
 
     if (!close_done) {
         log_printf("[EXPLOIT] SCMD 0x43 close timed out\n");
         return -60;
     }
+
     return 0;
 }
 
@@ -676,9 +727,9 @@ int mecha_read_staged_data(u16 nvram_word_start, u16 nvram_word_count, u8 *out_b
             errors++;
         }
 
-        // Store as big-endian to match ROM byte order
-        out_buf[w * 2]     = (u8)((word_val >> 8) & 0xFF);
-        out_buf[w * 2 + 1] = (u8)(word_val & 0xFF);
+        // Store as native little-endian to match ROM byte order
+        out_buf[w * 2]     = (u8)(word_val & 0xFF);
+        out_buf[w * 2 + 1] = (u8)((word_val >> 8) & 0xFF);
 
         if (cb && (w % 32 == 0 || w == nvram_word_count - 1)) {
             cb(w + 1, nvram_word_count, "Reading staged ROM data");
@@ -704,7 +755,7 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
     if (cb) cb(0, total_chunks, "Buffering config window...");
     mecha_init_config_window();
 
-    // Step 2: Detect active worker layout (0=standard, 1=BGA2)
+    // Step 2: Detect active worker layout
     int active_layout = mecha_detect_worker_layout();
 
     log_printf("[AUTO_DUMP] Testing exploit pre-flight with Layout %d (%s) at ROM 0x%06X (%s)...\n",
@@ -727,22 +778,24 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
         log_printf("[AUTO_DUMP] Layout %d staging returned error %d\n", active_layout, pre_ret);
     }
 
-    u16 orig_w0 = (u16)((nvram_backup[0] << 8) | nvram_backup[1]);
-    u16 orig_w1 = (u16)((nvram_backup[2] << 8) | nvram_backup[3]);
+    u16 orig_w0 = (u16)(nvram_backup[0] | (nvram_backup[1] << 8));
+    u16 orig_w1 = (u16)(nvram_backup[2] | (nvram_backup[3] << 8));
 
     int is_valid = 0;
-    if (preview_words[0] == 0xE600) {
-        is_valid = 1; // CXP102064 standard signature (v2) or CXP103049 active Bank FD header (v3)
-    } else if (preview_words[0] == 0x0000 && preview_words[1] == 0xA676) {
-        is_valid = 1; // CXP103049 alternate signature
-    } else if ((preview_words[0] != orig_w0 || preview_words[1] != orig_w1) &&
-               preview_words[1] != 0xFFFF) {
-        is_valid = 1; // Confirmed data transferred from ROM to NVRAM
+    if (pre_ret == 0) {
+        if (preview_words[0] == 0x00E6 || preview_words[0] == 0xE600) {
+            is_valid = 1; // Standard SPC970 opcode signature
+        } else if (preview_words[0] == 0x76A6 || (preview_words[0] == 0x0000 && preview_words[1] == 0xA676)) {
+            is_valid = 1; // CXP103049 alternate signature
+        } else if ((preview_words[0] != orig_w0 || preview_words[1] != orig_w1) &&
+                   preview_words[1] != 0xFFFF && preview_words[0] != 0x0000) {
+            is_valid = 1; // Confirmed data transferred from ROM to NVRAM
+        }
     }
 
     // If initial layout didn't validate, restore NVRAM and try alternative layouts
     if (!is_valid) {
-        for (int cand = 0; cand < 3; cand++) {
+        for (int cand = 0; cand < WORKER_LAYOUT_COUNT; cand++) {
             if (cand == active_layout) continue;
             mecha_restore_nvram(nvram_backup, NULL);
             log_printf("[AUTO_DUMP] Trying alternative Layout %d (%s)...\n",
@@ -758,10 +811,11 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
                            cand,
                            preview_words[0], preview_words[1], preview_words[2], preview_words[3],
                            preview_words[4], preview_words[5], preview_words[6], preview_words[7]);
-                if (preview_words[0] == 0xE600 ||
+                if (preview_words[0] == 0x00E6 || preview_words[0] == 0xE600 ||
+                    preview_words[0] == 0x76A6 ||
                     (preview_words[0] == 0x0000 && preview_words[1] == 0xA676) ||
                     ((preview_words[0] != orig_w0 || preview_words[1] != orig_w1) &&
-                     preview_words[1] != 0xFFFF)) {
+                     preview_words[1] != 0xFFFF && preview_words[0] != 0x0000)) {
                     active_layout = cand;
                     is_valid = 1;
                     log_printf("[AUTO_DUMP] Alternative Layout %d PASSED validation! Selected.\n", active_layout);
@@ -827,6 +881,96 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
         log_printf("[AUTO_DUMP] NVRAM successfully and completely restored from backup.\n");
     }
 
+    return 0;
+}
+
+int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct worker_flush_diff *diff) {
+    if (!pre_ram256 || !post_ram256) return -1;
+    if (diff) memset(diff, 0, sizeof(*diff));
+
+    // Step 1: Read baseline RAM (16 blocks = 256 bytes) via SCMD 0x40 (read) + 16x SCMD 0x41
+    u8 st = 0;
+    int err1 = mecha_read_ram_probe_blocks(region, 16, 16, pre_ram256, &st);
+    if (err1 != 0 || st != 0x00) {
+        log_printf("[FLUSH_PROBE] Failed to read baseline RAM for region %d: err=%d, stat=0x%02X\n", region, err1, st);
+        return -1;
+    }
+    mecha_delay(2000);
+
+    // Step 2: Open region in WRITE mode with count = 4 blocks (the 4 original blocks)
+    st = 0;
+    int ret = mecha_open_config(1, region, 4, &st);
+    if (ret != 0 || st != 0x00) {
+        log_printf("[FLUSH_PROBE] SCMD 0x40 open (write, reg %d, count 4) failed: ret=%d, stat=0x%02X\n", region, ret, st);
+        mecha_close_config(&st);
+        return -2;
+    }
+
+    // Step 3: Write the 4 original blocks
+    for (int b = 0; b < 4; b++) {
+        u8 blk[16];
+        memcpy(blk, &pre_ram256[b * 16], 16);
+        u8 wr_st = 0;
+        int wr_ret = mecha_write_config(blk, &wr_st);
+        if (wr_ret != 0 || wr_st != 0x00) {
+            log_printf("[FLUSH_PROBE] Block %d write failed: ret=%d, stat=0x%02X\n", b, wr_ret, wr_st);
+            mecha_close_config(&st);
+            return -3;
+        }
+        mecha_delay(200);
+    }
+
+    // On block 3, count reaches 0 -> firmware executes Config_Flush_To_NVRAM_Worker!
+    // Wait for worker completion via delay + SCMD 0x40 polling
+    for (int r = 0; r < 200; r++) {
+        u8 chk_st = 0xFF;
+        mecha_open_config(0, region, 0, &chk_st);
+        if (chk_st == 0x00) {
+            mecha_close_config(&chk_st);
+            break;
+        }
+        mecha_close_config(&chk_st);
+        mecha_delay(5000);
+    }
+    mecha_close_config(&st);
+    mecha_delay(5000);
+
+    // Step 4: Immediately read post-flush RAM (256 bytes)
+    int err2 = mecha_read_ram_probe_blocks(region, 16, 16, post_ram256, &st);
+    if (err2 != 0 || st != 0x00) {
+        log_printf("[FLUSH_PROBE] Failed to read post-flush RAM: err=%d, stat=0x%02X\n", err2, st);
+        return -4;
+    }
+
+    // Step 5: Diff pre vs post
+    int total_changed = 0;
+    int overflow_changed = 0;
+    u16 base_ram = (region == 0) ? 0x1890 : (region == 1 ? 0x18D0 : 0x1940);
+    for (int i = 0; i < 256; i++) {
+        if (pre_ram256[i] != post_ram256[i]) {
+            total_changed++;
+            if (i >= 112) overflow_changed++;
+            u16 ram_addr = base_ram + i;
+            log_printf("[FLUSH_DIFF] Reg %d RAM 0x%04X (blk %d, byte %d): 0x%02X -> 0x%02X\n",
+                       region, ram_addr, i / 16, i % 16, pre_ram256[i], post_ram256[i]);
+            if (diff) {
+                if (post_ram256[i] == 0x01 || post_ram256[i] == 0x02 || post_ram256[i] == 0x03) {
+                    diff->flags_detected_offset = ram_addr;
+                }
+            }
+        }
+    }
+
+    if (diff) {
+        diff->total_changed_bytes = total_changed;
+        diff->overflow_changed_bytes = overflow_changed;
+        snprintf(diff->summary, sizeof(diff->summary),
+                 "Region %d flush completed. %d bytes modified (overflow: %d).",
+                 region, total_changed, overflow_changed);
+    }
+
+    log_printf("[FLUSH_PROBE] Region %d flush finished: %d bytes changed (overflow: %d).\n",
+               region, total_changed, overflow_changed);
     return 0;
 }
 

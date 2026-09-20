@@ -98,6 +98,12 @@ void mecha_delay(int iterations);
 int mecha_query_scmd03_subcmd(u8 subcmd, u8 *out16, u8 *status);
 
 // Worker layout specification matching verified SPC970-MechaLIBerator
+#define WORKER_LAYOUT_COUNT          4
+#define LAYOUT_STANDARD_V2           0  // standard-fields (v2: CXP102064 2.04..2.14)
+#define LAYOUT_V3_MARKER_00          1  // fields-2-bytes-earlier (v3: CXP103049 marker 00)
+#define LAYOUT_V3_MARKER_01          2  // shifted-marker-01-pointer-at-6 (v3: CXP103049 marker 01)
+#define LAYOUT_V1_EARLY_V2           3  // early-v1-v202-fields (v1/v2.02: CXP101064 / CXP102064 2.02)
+
 struct worker_layout {
     const char *name;
     u8 flags_block;
@@ -125,7 +131,7 @@ int mecha_init_config_window(void);
 
 // Automatically detect worker layout from buffered config window:
 // Returns: 0 = standard-fields (v2), 1 = fields-2-bytes-earlier (v3 marker 00),
-//          2 = shifted-marker-01-pointer-at-6 (v3 marker 01), or negative if unknown.
+//          2 = shifted-marker-01-pointer-at-6 (v3 marker 01), 3 = early-v1-v202-fields (v1/v2.02)
 int mecha_detect_worker_layout(void);
 
 const struct worker_layout *mecha_get_layout(int layout_index);
@@ -138,7 +144,7 @@ extern int g_detected_worker_layout;
 // rom_source_addr: 24-bit ROM address to read from (e.g. 0xFC0000)
 // nvram_word_start: first EEPROM word to stage data into (e.g. 0, 128, 256, 384)
 // nvram_word_count: number of 16-bit words (e.g. 128)
-// layout_mode: layout index (0 = standard, 1 = BGA2 marker 00, 2 = BGA2 marker 01)
+// layout_mode: layout index (0 = standard, 1 = BGA2 marker 00, 2 = BGA2 marker 01, 3 = early v1/v202)
 // Returns 0 on success, negative on error.
 int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvram_word_count, int layout_mode);
 
@@ -151,5 +157,18 @@ int mecha_read_staged_data(u16 nvram_word_start, u16 nvram_word_count, u8 *out_b
 // Dumps 256KB on v2 (Banks FC, FD, FE, FF) or 192KB on v3 (Active Banks FD, FE, FF).
 // rom_buf must be at least ROM_SIZE_BYTES.
 int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, ProgressCallback cb);
+
+// Diagnostic structure for worker flush observation
+struct worker_flush_diff {
+    int total_changed_bytes;
+    int overflow_changed_bytes;
+    u16 flags_detected_offset;
+    u16 ptr_detected_offset;
+    u16 dest_detected_offset;
+    char summary[256];
+};
+
+// Perform a safe hardware-native 4-block flush to observe MechaCon internal worker pointers
+int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct worker_flush_diff *diff);
 
 #endif // MECHA_H
