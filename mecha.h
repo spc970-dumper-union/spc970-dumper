@@ -129,6 +129,9 @@ struct worker_layout {
 // Probe and buffer full 16 blocks (256 bytes) of Config Region 2 into g_config_window
 int mecha_init_config_window(void);
 
+// Clean/zero the overflow RAM region (Blocks 8-15) to prevent stale state contamination
+int mecha_clean_overflow_ram(void);
+
 // Automatically detect worker layout from buffered config window:
 // Returns: 0 = standard-fields (v2), 1 = fields-2-bytes-earlier (v3 marker 00),
 //          2 = shifted-marker-01-pointer-at-6 (v3 marker 01), 3 = early-v1-v202-fields (v1/v2.02)

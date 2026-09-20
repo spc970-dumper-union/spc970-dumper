@@ -459,12 +459,12 @@ static const struct worker_layout known_worker_layouts[WORKER_LAYOUT_COUNT] = {
     },
     {
         .name = "early-v1-v202-fields",
-        .flags_block = 12, .flags_byte = 12,
-        .source_pointer_offset = 14, .flags_mutable_end_byte = 15,
-        .control_block = 14, .source_offset_byte = 2,
-        .word_count_byte = 3, .worker_state_byte = 4,
-        .destination_block = 14, .destination_low_byte = 6,
-        .destination_high_byte = 7, .checksum_adjust_byte = 13,
+        .flags_block = 11, .flags_byte = 6,
+        .source_pointer_offset = 8, .flags_mutable_end_byte = 13,
+        .control_block = 12, .source_offset_byte = 12,
+        .word_count_byte = 13, .worker_state_byte = 14,
+        .destination_block = 13, .destination_low_byte = 0,
+        .destination_high_byte = 1, .checksum_adjust_byte = 0xff,
         .scratch_boundary_byte = 0,
         .marker_block = 0xff,
         .marker_byte = 0, .marker_value = 0,
@@ -472,6 +472,39 @@ static const struct worker_layout known_worker_layouts[WORKER_LAYOUT_COUNT] = {
         .tail_signature = NULL
     }
 };
+
+int mecha_clean_overflow_ram(void) {
+    u8 status = 0;
+    int ret = mecha_open_config(1, 2, 0, &status);
+    if (ret != 0) {
+        mecha_close_config(&status);
+        mecha_delay(5000);
+        ret = mecha_open_config(1, 2, 0, &status);
+        if (ret != 0) return -1;
+    }
+    u8 block[16];
+    for (int i = 0; i < 16; i++) {
+        memcpy(block, &g_config_window[i * 16], 16);
+        if (i == 7) {
+            block[0] = 0xFF;
+            if (block[1] == 0) block[1] = 0x67;
+        } else if (i >= 8) {
+            memset(block, 0, 16);
+        }
+        u8 sum = 0;
+        for (int b = 0; b < 15; b++) sum += block[b];
+        block[15] = sum;
+        if (mecha_write_config_raw(block) != 0) {
+            mecha_close_config(&status);
+            return -2;
+        }
+        mecha_delay(150);
+    }
+    mecha_close_config(&status);
+    mecha_delay(2000);
+    log_printf("[CONFIG] Cleaned RAM overflow blocks 8-15.\n");
+    return 0;
+}
 
 int mecha_init_config_window(void) {
     u8 status = 0;
@@ -693,24 +726,35 @@ int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvr
 
     // Wait for worker to finish and close session (poll SCMD 0x43)
     int close_done = 0;
+    u8 final_stat = 0xFF;
+    int retries_used = 0;
     for (int retry = 0; retry < 1000; retry++) {
+        retries_used = retry;
         u8 close_stat = 0xFF;
         mecha_close_config(&close_stat);
+        final_stat = close_stat;
         if (close_stat == 0x00) {
             close_done = 1;
             break;
         }
         if (close_stat != 0x01) {
-            log_printf("[EXPLOIT] SCMD 0x43 close error: stat=0x%02X\n", close_stat);
+            log_printf("[EXPLOIT] SCMD 0x43 close error: stat=0x%02X (retry %d)\n", close_stat, retry);
             break;
         }
         mecha_delay(5000); // 5ms per poll
+    }
+
+    if (final_stat != 0x00 || retries_used > 5) {
+        log_printf("[EXPLOIT] Staging completion: close_stat=0x%02X, retries=%d\n", final_stat, retries_used);
     }
 
     if (!close_done) {
         log_printf("[EXPLOIT] SCMD 0x43 close timed out\n");
         return -60;
     }
+
+    // Ensure physical NVRAM write settling delay
+    mecha_delay(2000);
 
     return 0;
 }
@@ -758,6 +802,7 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
     // Step 2: Detect active worker layout
     int active_layout = mecha_detect_worker_layout();
 
+    mecha_clean_overflow_ram();
     log_printf("[AUTO_DUMP] Testing exploit pre-flight with Layout %d (%s) at ROM 0x%06X (%s)...\n",
                active_layout, known_worker_layouts[active_layout].name,
                (unsigned)rom_base, is_v3 ? "v3 Native 192KB (Banks FD-FF)" : "v2 Full 256KB (Banks FC-FF)");
@@ -798,6 +843,7 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
         for (int cand = 0; cand < WORKER_LAYOUT_COUNT; cand++) {
             if (cand == active_layout) continue;
             mecha_restore_nvram(nvram_backup, NULL);
+            mecha_clean_overflow_ram();
             log_printf("[AUTO_DUMP] Trying alternative Layout %d (%s)...\n",
                        cand, known_worker_layouts[cand].name);
 
@@ -829,6 +875,7 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
     if (!is_valid) {
         log_printf("[EXPLOIT_ERR] Staging pre-flight validation failed with all layouts! Automatically restoring NVRAM...\n");
         mecha_restore_nvram(nvram_backup, NULL);
+        mecha_clean_overflow_ram();
         log_printf("[FAILSAFE] NVRAM automatically restored.\n");
         return (pre_ret != 0) ? pre_ret : -2;
     }
@@ -880,6 +927,8 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
     } else {
         log_printf("[AUTO_DUMP] NVRAM successfully and completely restored from backup.\n");
     }
+
+    mecha_clean_overflow_ram();
 
     return 0;
 }
