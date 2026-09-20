@@ -28,6 +28,10 @@ jobs:
         run: |
           ls -lh ps2_mecha_tool.elf ps2_mecha_tool_stripped.elf
 
+      - name: Package Release Archive
+        run: |
+          zip -9 ps2_mecha_tool.zip ps2_mecha_tool_stripped.elf ps2_mecha_tool.elf README.md
+
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -35,9 +39,23 @@ jobs:
           path: |
             ps2_mecha_tool.elf
             ps2_mecha_tool_stripped.elf
+            ps2_mecha_tool.zip
           if-no-files-found: error
 
-      - name: Create Release and Upload Assets
+      - name: Create Automatic Pre-Release (Commits)
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: marvinpinto/action-automatic-releases@latest
+        with:
+          repo_token: "${{ secrets.GITHUB_TOKEN }}"
+          prerelease: true
+          automatic_release_tag: "latest"
+          title: "Development build"
+          files: |
+            ps2_mecha_tool.elf
+            ps2_mecha_tool_stripped.elf
+            ps2_mecha_tool.zip
+
+      - name: Create Tagged Release (Tags)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
@@ -45,4 +63,5 @@ jobs:
           files: |
             ps2_mecha_tool.elf
             ps2_mecha_tool_stripped.elf
+            ps2_mecha_tool.zip
           generate_release_notes: true
