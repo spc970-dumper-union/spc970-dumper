@@ -98,11 +98,13 @@ void mecha_delay(int iterations);
 int mecha_query_scmd03_subcmd(u8 subcmd, u8 *out16, u8 *status);
 
 // Worker layout specification matching verified SPC970-MechaLIBerator
-#define WORKER_LAYOUT_COUNT          4
-#define LAYOUT_STANDARD_V2           0  // standard-fields (v2: CXP102064 2.04..2.14)
+#define WORKER_LAYOUT_COUNT          5
+#define LAYOUT_STANDARD_V2           0  // standard-fields (v2: CXP102064 2.04..2.14, base 0x1940, worker at 0x19F6)
 #define LAYOUT_V3_MARKER_00          1  // fields-2-bytes-earlier (v3: CXP103049 marker 00)
 #define LAYOUT_V3_MARKER_01          2  // shifted-marker-01-pointer-at-6 (v3: CXP103049 marker 01)
-#define LAYOUT_V1_EARLY_V2           3  // early-v1-v202-fields (v1/v2.02: CXP101064 / CXP102064 2.02)
+#define LAYOUT_V1_CXP101064          3  // cxp101064-qfp-v1 (v1.02..v1.03: CXP101064 QFP, base 0x1940, worker at 0x1A0C)
+#define LAYOUT_EARLY_CXP102064       4  // early-cxp102064-v1v2 (v1.06..v1.08, v2.02: CXP102064, base 0x1940, worker at 0x1A0C)
+#define LAYOUT_V1_EARLY_V2           LAYOUT_V1_CXP101064  // Compatibility alias
 
 struct worker_layout {
     const char *name;

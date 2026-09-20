@@ -458,17 +458,31 @@ static const struct worker_layout known_worker_layouts[WORKER_LAYOUT_COUNT] = {
         .tail_signature = shifted_worker_tail_signature
     },
     {
-        .name = "early-v1-v202-fields",
-        .flags_block = 11, .flags_byte = 6,
-        .source_pointer_offset = 8, .flags_mutable_end_byte = 13,
-        .control_block = 12, .source_offset_byte = 12,
-        .word_count_byte = 13, .worker_state_byte = 14,
-        .destination_block = 13, .destination_low_byte = 0,
-        .destination_high_byte = 1, .checksum_adjust_byte = 0xff,
+        .name = "cxp101064-qfp-v1",
+        .flags_block = 12, .flags_byte = 12,
+        .source_pointer_offset = 14, .flags_mutable_end_byte = 14,
+        .control_block = 14, .source_offset_byte = 2,
+        .word_count_byte = 3, .worker_state_byte = 4,
+        .destination_block = 14, .destination_low_byte = 6,
+        .destination_high_byte = 7, .checksum_adjust_byte = 13,
         .scratch_boundary_byte = 0,
         .marker_block = 0xff,
         .marker_byte = 0, .marker_value = 0,
         .layout_signature_salt = 0x31303130u,
+        .tail_signature = NULL
+    },
+    {
+        .name = "early-cxp102064-v1v2",
+        .flags_block = 12, .flags_byte = 12,
+        .source_pointer_offset = 14, .flags_mutable_end_byte = 14,
+        .control_block = 14, .source_offset_byte = 2,
+        .word_count_byte = 3, .worker_state_byte = 4,
+        .destination_block = 14, .destination_low_byte = 6,
+        .destination_high_byte = 7, .checksum_adjust_byte = 13,
+        .scratch_boundary_byte = 0,
+        .marker_block = 0xff,
+        .marker_byte = 0, .marker_value = 0,
+        .layout_signature_salt = 0x31303230u,
         .tail_signature = NULL
     }
 };
@@ -565,14 +579,14 @@ int mecha_detect_worker_layout(void) {
     }
 
     if (match_index == -1) {
-        // Safe fallback using firmware version
-        // Layout 3 (early-v1-v202-fields) covers:
-        //   - Real v1.xx (CXP101064): g_mecha_ver[1] == 1
-        //   - v2.02 (early CXP102064): g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2
-        //     (no standard worker tail signature in RAM, so pattern match returned -1)
-        if (g_mecha_ver[1] == 1 ||
-            (g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2)) {
-            match_index = LAYOUT_V1_EARLY_V2; // 3
+        // Safe fallback using firmware version and chip generation
+        if (g_mecha_ver[1] == 1 && g_mecha_ver[2] <= 3) {
+            // CXP101064 (v1.02, v1.03): QFP v1 with 0x1956 base
+            match_index = LAYOUT_V1_CXP101064; // 3
+        } else if ((g_mecha_ver[1] == 1 && g_mecha_ver[2] >= 6) ||
+                   (g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2)) {
+            // Early CXP102064 (v1.06..v1.08, v2.02): 0x1940 base with 0x1A0C worker
+            match_index = LAYOUT_EARLY_CXP102064; // 4
         } else if (g_mecha_ver[1] >= 3 || (g_mecha_ver[1] == 2 && g_mecha_ver[2] >= 14)) {
             match_index = LAYOUT_V3_MARKER_00; // 1
         } else {
