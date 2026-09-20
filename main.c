@@ -467,7 +467,7 @@ static void show_system_info(void) {
     scr_printf(" [NVRAM] Serial No.   : %07u (EMCS: 0x%02X)\n", g_serial,
                g_emcs);
   } else {
-    scr_printf(" [NVRAM] Serial/Model : <Run [2] Backup NVRAM to decode>\n");
+    scr_printf(" [NVRAM] Serial/Model : <Run Dump or NVRAM Backup to decode>\n");
   }
 
   scr_printf(" [SCMD 0x03-00] Ver   : MD 1.39 v%d.%02d (Rev 0x%02X)\n",
@@ -525,7 +525,14 @@ static void show_system_info(void) {
 
   scr_printf("\n Target Dump Path: %s/\n", g_dump_dir);
   scr_printf(" NVRAM in Memory : %s\n",
-             g_nvram_backed_up ? "YES (1024 bytes safe)" : "NO (Run option 2)");
+             g_nvram_backed_up ? "YES (1024 bytes safe)" : "NO (Use Advanced Tools menu)");
+
+  // Automatically flush and save debug log to USB when viewing diagnostics
+  char log_path[256];
+  snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
+  if (log_save_to_file(log_path) == 0) {
+    scr_printf(" Debug Log File  : [SAVED] %s/DEBUG_LOG.TXT\n", g_dump_dir);
+  }
 
   wait_for_cross();
 }
@@ -1226,7 +1233,7 @@ static void restore_nvram_action(void) {
 
   if (!g_nvram_backed_up) {
     scr_printf("[-] Error: No NVRAM backup in memory!\n");
-    scr_printf("    Please execute option [2] Backup NVRAM first.\n");
+    scr_printf("    Please execute option [1] Backup NVRAM in Advanced Tools first.\n");
     wait_for_cross();
     return;
   }
@@ -1417,7 +1424,7 @@ static void save_debug_log_action(void) {
 
 static void advanced_tools_menu(void) {
   int sub_selected = 0;
-  const int sub_items = 6;
+  const int sub_items = 7;
 
   while (1) {
     scr_clear();
@@ -1436,8 +1443,10 @@ static void advanced_tools_menu(void) {
                (sub_selected == 3) ? "->" : "  ");
     scr_printf(" %s [5] EEPROM Worker Discovery & Flush Diagnostics\n",
                (sub_selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Back to Main Menu\n\n",
+    scr_printf(" %s [6] Export Debug Log to USB Storage\n",
                (sub_selected == 5) ? "->" : "  ");
+    scr_printf(" %s [7] Back to Main Menu\n\n",
+               (sub_selected == 6) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     scr_printf(" NVRAM State : %s\n",
@@ -1472,6 +1481,9 @@ static void advanced_tools_menu(void) {
         worker_flush_diagnostics_action();
         break;
       case 5:
+        save_debug_log_action();
+        break;
+      case 6:
         return;
       }
     } else if (btn & PAD_TRIANGLE) {
@@ -1538,7 +1550,7 @@ int main(int argc, char *argv[]) {
   }
 
   int selected = 0;
-  const int menu_items = 5;
+  const int menu_items = 4;
 
   while (1) {
     scr_clear();
@@ -1558,20 +1570,16 @@ int main(int argc, char *argv[]) {
                (selected == 0) ? "->" : "  ");
     scr_printf("      -> Auto Exploit, POST Verify & NVRAM Safe Backup\n\n");
 
-    scr_printf(" %s [2] Hardware Diagnostics & System Telemetry\n",
+    scr_printf(" %s [2] Hardware Diagnostics & Export Debug Log\n",
                (selected == 1) ? "->" : "  ");
-    scr_printf("      -> View detailed hardware identity, registers & SCMD info\n\n");
+    scr_printf("      -> View full console identity and save DEBUG_LOG.TXT to USB\n\n");
 
-    scr_printf(" %s [3] Save Current Debug Log to USB\n",
+    scr_printf(" %s [3] Advanced Tools & Manual Operations...\n",
                (selected == 2) ? "->" : "  ");
-    scr_printf("      -> Export all execution telemetry to %s/\n\n", g_dump_dir);
-
-    scr_printf(" %s [4] Advanced Tools & Manual Operations...\n",
-               (selected == 3) ? "->" : "  ");
     scr_printf("      -> Standalone NVRAM backup, restore, worker & RAM probes\n\n");
 
-    scr_printf(" %s [5] Exit to OSD / Browser\n\n",
-               (selected == 4) ? "->" : "  ");
+    scr_printf(" %s [4] Exit to OSD / Browser\n\n",
+               (selected == 3) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     if (g_storage_ready) {
@@ -1602,12 +1610,9 @@ int main(int argc, char *argv[]) {
         show_system_info();
         break;
       case 2:
-        save_debug_log_action();
-        break;
-      case 3:
         advanced_tools_menu();
         break;
-      case 4:
+      case 3:
         return 0;
       }
     }
