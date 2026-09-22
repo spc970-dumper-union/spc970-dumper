@@ -190,8 +190,24 @@ static void init_ps2_system(void) {
   scr_printf(" [+] System initialized successfully!\n\n");
 }
 
+// Write a full buffer to an already-open fd and log (rather than silently
+// swallow) a short/failed write. USB mass storage can be removed, fill up,
+// or return a short write mid-dump; without this check a truncated ROM.BIN
+// or NVRAM.BIN looks identical to a good one to both the tool and operator.
+// Returns 0 on a complete write, -1 otherwise.
+static int write_checked(int fd, const void *buf, size_t len, const char *path) {
+  ssize_t written = write(fd, buf, len);
+  if (written != (ssize_t)len) {
+    log_printf("[FILE_ERR] Short write to %s: %ld/%lu bytes\n", path,
+               (long)written, (unsigned long)len);
+    return -1;
+  }
+  return 0;
+}
+
 // GUI Progress Bar
 static void draw_progress_bar(int current, int total, const char *label) {
+  if (total <= 0) return; // Avoid division by zero on a degenerate/indeterminate total
   const int bar_width = 28;
   int filled = (current * bar_width) / total;
   if (filled > bar_width)
@@ -320,31 +336,34 @@ static void query_initial_hardware(void) {
   memset(dummy_nvm, 0xFF, sizeof(dummy_nvm));
   u16 w = 0;
   u8 st = 0;
+  // Byte order matches mecha_backup_nvram()'s canonical little-endian packing
+  // (lo byte first) so extract_*_from_nvram() hits its native-LE fast path
+  // instead of relying on its big-endian fallback.
   // Old layout words: 0x0E4 (Model), 0x0E6..0x0E7 (Serial)
   if (mecha_read_nvm_word(0x0E4, &w, &st) == 0) {
-    dummy_nvm[0x1C8] = (u8)(w >> 8);
-    dummy_nvm[0x1C9] = (u8)w;
+    dummy_nvm[0x1C8] = (u8)w;
+    dummy_nvm[0x1C9] = (u8)(w >> 8);
   }
   if (mecha_read_nvm_word(0x0E6, &w, &st) == 0) {
-    dummy_nvm[0x1CC] = (u8)(w >> 8);
-    dummy_nvm[0x1CD] = (u8)w;
+    dummy_nvm[0x1CC] = (u8)w;
+    dummy_nvm[0x1CD] = (u8)(w >> 8);
   }
   if (mecha_read_nvm_word(0x0E7, &w, &st) == 0) {
-    dummy_nvm[0x1CE] = (u8)(w >> 8);
-    dummy_nvm[0x1CF] = (u8)w;
+    dummy_nvm[0x1CE] = (u8)w;
+    dummy_nvm[0x1CF] = (u8)(w >> 8);
   }
   // New layout words: 0x0F8 (Model), 0x0FA..0x0FB (Serial)
   if (mecha_read_nvm_word(0x0F8, &w, &st) == 0) {
-    dummy_nvm[0x1F0] = (u8)(w >> 8);
-    dummy_nvm[0x1F1] = (u8)w;
+    dummy_nvm[0x1F0] = (u8)w;
+    dummy_nvm[0x1F1] = (u8)(w >> 8);
   }
   if (mecha_read_nvm_word(0x0FA, &w, &st) == 0) {
-    dummy_nvm[0x1F4] = (u8)(w >> 8);
-    dummy_nvm[0x1F5] = (u8)w;
+    dummy_nvm[0x1F4] = (u8)w;
+    dummy_nvm[0x1F5] = (u8)(w >> 8);
   }
   if (mecha_read_nvm_word(0x0FB, &w, &st) == 0) {
-    dummy_nvm[0x1F6] = (u8)(w >> 8);
-    dummy_nvm[0x1F7] = (u8)w;
+    dummy_nvm[0x1F6] = (u8)w;
+    dummy_nvm[0x1F7] = (u8)(w >> 8);
   }
   g_model_id = extract_model_id_from_nvram(dummy_nvm);
   g_serial = extract_serial_from_nvram(dummy_nvm, &g_emcs);
@@ -548,7 +567,10 @@ static void backup_nvram_action(void) {
 
   log_printf("[NVRAM] Starting full backup of 512 words via SCMD 0x0A...\n");
   int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
-  g_nvram_backed_up = 1;
+  // Only trust this buffer for a later restore if every word was actually read;
+  // a partial backup contains stale memset(0) words at the failed positions,
+  // and other menus check g_nvram_backed_up to decide whether to skip re-reading it.
+  g_nvram_backed_up = (read_errs == 0);
 
   if (read_errs > 0) {
     log_printf("[WARN] NVRAM backup completed with %d word read errors (status "
@@ -575,10 +597,11 @@ static void backup_nvram_action(void) {
   int saved_mass = 0;
   int fd = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd >= 0) {
-    write(fd, g_nvram_backup, NVRAM_SIZE_BYTES);
+    saved_mass = (write_checked(fd, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path) == 0);
     close(fd);
-    saved_mass = 1;
-    log_printf("[FILE] Successfully saved %s\n", nvram_path);
+    if (saved_mass) {
+      log_printf("[FILE] Successfully saved %s\n", nvram_path);
+    }
   } else {
     log_printf("[WARN] Failed to open %s for writing\n", nvram_path);
   }
@@ -591,6 +614,7 @@ static void backup_nvram_action(void) {
   } else {
     scr_printf("[!] NVRAM backed up with %d word errors (see log)!\n",
                read_errs);
+    scr_printf("[!] Incomplete: NOT marked safe for auto-restore. Retry before exploiting.\n");
   }
   scr_printf("    Decoded Serial: %07u | Model ID: 0x%04X (%s)\n", g_serial,
              g_model_id, get_model_id_desc(g_model_id));
@@ -664,10 +688,14 @@ static void probe_config_overflow_action(void) {
 
     int fd = open(probe_bin, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0) {
-      write(fd, probe256, sizeof(probe256));
+      int wr_ok = (write_checked(fd, probe256, sizeof(probe256), probe_bin) == 0);
       close(fd);
-      scr_printf(" [+] Saved RAM snapshot: %s\n", probe_bin);
-      log_printf("[FILE] Saved %s\n", probe_bin);
+      if (wr_ok) {
+        scr_printf(" [+] Saved RAM snapshot: %s\n", probe_bin);
+        log_printf("[FILE] Saved %s\n", probe_bin);
+      } else {
+        scr_printf(" [!] Warning: %s may be truncated!\n", probe_bin);
+      }
     }
 
     FILE *ft = fopen(probe_txt, "w");
@@ -692,10 +720,14 @@ static void probe_config_overflow_action(void) {
     snprintf(ext_bin, sizeof(ext_bin), "%s/PROBE_EXT512.BIN", g_dump_dir);
     int fd_ext = open(ext_bin, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_ext >= 0) {
-      write(fd_ext, probe512, sizeof(probe512));
+      int wr_ok = (write_checked(fd_ext, probe512, sizeof(probe512), ext_bin) == 0);
       close(fd_ext);
-      scr_printf(" [+] Saved extended snapshot: %s\n", ext_bin);
-      log_printf("[FILE] Saved %s\n", ext_bin);
+      if (wr_ok) {
+        scr_printf(" [+] Saved extended snapshot: %s\n", ext_bin);
+        log_printf("[FILE] Saved %s\n", ext_bin);
+      } else {
+        scr_printf(" [!] Warning: %s may be truncated!\n", ext_bin);
+      }
     }
   }
 
@@ -790,9 +822,10 @@ static void full_hardware_mapping_action(void) {
     snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
     int fd = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd >= 0) {
-      write(fd, g_nvram_backup, NVRAM_SIZE_BYTES);
+      if (write_checked(fd, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path) == 0) {
+        log_printf("[FILE] Successfully saved %s\n", nvram_path);
+      }
       close(fd);
-      log_printf("[FILE] Successfully saved %s\n", nvram_path);
     }
   } else {
     scr_printf(" [*] Step 1/4: NVRAM already backed up.\n");
@@ -825,7 +858,7 @@ static void full_hardware_mapping_action(void) {
       snprintf(path64, sizeof(path64), "%s/REGION%d_STD64.BIN", g_dump_dir, r);
       int fd = open(path64, O_WRONLY | O_CREAT | O_TRUNC, 0666);
       if (fd >= 0) {
-        write(fd, buf64, sizeof(buf64));
+        write_checked(fd, buf64, sizeof(buf64), path64);
         close(fd);
       }
 
@@ -858,7 +891,7 @@ static void full_hardware_mapping_action(void) {
         snprintf(path256, sizeof(path256), "%s/REGION%d_RAM256.BIN", g_dump_dir, r);
         int fd = open(path256, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (fd >= 0) {
-          write(fd, buf256, sizeof(buf256));
+          write_checked(fd, buf256, sizeof(buf256), path256);
           close(fd);
         }
       }
@@ -999,9 +1032,8 @@ static void full_dump_and_verify_action(void) {
   log_printf("[AUTO_DUMP] Full automated workflow initiated...\n");
 
   if (!g_nvram_backed_up) {
-    scr_printf(" [*] Step 1/5: Backing up NVRAM first for safety...\n");
+    scr_printf(" [*] Step 1/4: Backing up NVRAM first for safety...\n");
     int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
-    g_nvram_backed_up = 1;
     if (read_errs > 0) {
       log_printf("[WARN] Step 1 backup had %d word errors\n", read_errs);
     }
@@ -1014,14 +1046,33 @@ static void full_dump_and_verify_action(void) {
     snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
     int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_nvm >= 0) {
-      write(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES);
+      if (write_checked(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path) == 0) {
+        log_printf("[FILE] Saved NVRAM backup: %s\n", nvram_path);
+      }
       close(fd_nvm);
-      log_printf("[FILE] Saved NVRAM backup: %s\n", nvram_path);
     } else {
       log_printf("[FILE_ERR] Failed to save NVRAM backup: %s\n", nvram_path);
     }
+
+    // The exploit below writes into live EEPROM and relies on g_nvram_backup
+    // to restore it afterwards. A partial backup has stale zero words at the
+    // failed positions, so restoring from it would corrupt those words on
+    // the console instead of restoring them. Refuse to proceed.
+    if (read_errs > 0) {
+      scr_printf("\n [!] NVRAM backup incomplete (%d word errors). Exploit ABORTED for safety.\n",
+                 read_errs);
+      scr_printf("     No EEPROM writes were made. Retry the backup (option 1) and try again.\n\n");
+      log_printf("[ABORT] NVRAM backup incomplete (%d errors) - refusing to run exploit.\n",
+                 read_errs);
+      char log_path_abort[256];
+      snprintf(log_path_abort, sizeof(log_path_abort), "%s/DEBUG_LOG.TXT", g_dump_dir);
+      log_save_to_file(log_path_abort);
+      wait_for_cross();
+      return;
+    }
+    g_nvram_backed_up = 1;
   } else {
-    scr_printf(" [*] Step 1/5: NVRAM already safely backed up.\n");
+    scr_printf(" [*] Step 1/4: NVRAM already safely backed up.\n");
   }
 
   scr_setXY(2, 7);
@@ -1083,10 +1134,13 @@ static void full_dump_and_verify_action(void) {
   snprintf(rom_path, sizeof(rom_path), "%s/ROM.BIN", g_dump_dir);
   int fd_rom = open(rom_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd_rom >= 0) {
-    write(fd_rom, g_rom_buffer, dumped_rom_size);
+    if (write_checked(fd_rom, g_rom_buffer, dumped_rom_size, rom_path) == 0) {
+      log_printf("[FILE] Saved ROM image (%u bytes): %s\n", dumped_rom_size,
+                 rom_path);
+    } else {
+      scr_printf(" [!] Warning: ROM.BIN may be truncated on disk!\n");
+    }
     close(fd_rom);
-    log_printf("[FILE] Saved ROM image (%u bytes): %s\n", dumped_rom_size,
-               rom_path);
   } else {
     log_printf("[FILE_ERR] Failed to save ROM image: %s\n", rom_path);
   }
@@ -1096,6 +1150,7 @@ static void full_dump_and_verify_action(void) {
   scr_printf("=====================================================\n");
   scr_printf("         POST Hardware Checksum Verification         \n");
   scr_printf("=====================================================\n\n");
+  scr_printf(" [*] Step 3/4: Verifying dump against hardware checksums...\n\n");
 
   RomVerifyResult res;
   verify_spc970_rom(g_rom_buffer, dumped_rom_size, &res);
@@ -1275,7 +1330,8 @@ static void worker_flush_diagnostics_action(void) {
   if (!g_nvram_backed_up) {
     scr_printf(" [*] Step 1/3: Backing up NVRAM first for safety...\n");
     int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
-    g_nvram_backed_up = 1;
+    // Only trust this buffer for a later restore if every word was actually read.
+    g_nvram_backed_up = (read_errs == 0);
     if (read_errs > 0) {
       log_printf("[WARN] NVRAM backup had %d word errors\n", read_errs);
     }
@@ -1287,7 +1343,7 @@ static void worker_flush_diagnostics_action(void) {
     snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
     int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
     if (fd_nvm >= 0) {
-      write(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES);
+      write_checked(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path);
       close(fd_nvm);
     }
   } else {
@@ -1321,9 +1377,9 @@ static void worker_flush_diagnostics_action(void) {
     snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG2.BIN", g_dump_dir);
     snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG2.BIN", g_dump_dir);
     int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write(fd, pre_r2, 256); close(fd); }
+    if (fd >= 0) { write_checked(fd, pre_r2, 256, pre_path); close(fd); }
     fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write(fd, post_r2, 256); close(fd); }
+    if (fd >= 0) { write_checked(fd, post_r2, 256, post_path); close(fd); }
   } else {
     scr_printf(" [-] Region 2 Flush Probe failed with code %d\n", ret_r2);
   }
@@ -1346,9 +1402,9 @@ static void worker_flush_diagnostics_action(void) {
     snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG1.BIN", g_dump_dir);
     snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG1.BIN", g_dump_dir);
     int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write(fd, pre_r1, 256); close(fd); }
+    if (fd >= 0) { write_checked(fd, pre_r1, 256, pre_path); close(fd); }
     fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write(fd, post_r1, 256); close(fd); }
+    if (fd >= 0) { write_checked(fd, post_r1, 256, post_path); close(fd); }
   } else {
     scr_printf(" [-] Region 1 Flush Probe failed with code %d\n", ret_r1);
   }

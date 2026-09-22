@@ -59,7 +59,8 @@ int mecha_read_rtc(u8 *out_rtc8, u8 *status);
 int mecha_read_ilink_id(u8 *out_ilink_id8, u8 *status);
 
 // SCMD 0x17: Reads 16-byte Model Name ASCII string via offsets 0 and 8 (status: 0=OK, 0x80=Error/Unsupported)
-int mecha_read_model_name(char *out_model16, u8 *status);
+// out_model17 must point to at least 17 bytes (16 chars + NUL terminator).
+int mecha_read_model_name(char *out_model17, u8 *status);
 
 // SCMD 0x40: Config area session open (in[0]=mode: 0=read/1=write, in[1]=region: 0..2, in[2]=block_count)
 // Status returned in *status: 0x00=Success, 0x80=Error
