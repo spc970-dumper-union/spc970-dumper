@@ -470,21 +470,7 @@ static const struct worker_layout known_worker_layouts[WORKER_LAYOUT_COUNT] = {
         .tail_signature = shifted_worker_tail_signature
     },
     {
-        .name = "cxp101064-qfp-v1",
-        .flags_block = 12, .flags_byte = 12,
-        .source_pointer_offset = 14, .flags_mutable_end_byte = 14,
-        .control_block = 14, .source_offset_byte = 2,
-        .word_count_byte = 3, .worker_state_byte = 4,
-        .destination_block = 14, .destination_low_byte = 6,
-        .destination_high_byte = 7, .checksum_adjust_byte = 13,
-        .scratch_boundary_byte = 0,
-        .marker_block = 0xff,
-        .marker_byte = 0, .marker_value = 0,
-        .layout_signature_salt = 0x31303130u,
-        .tail_signature = NULL
-    },
-    {
-        .name = "early-cxp102064-v1v2",
+        .name = "early-cxp102064-v202",
         .flags_block = 12, .flags_byte = 12,
         .source_pointer_offset = 14, .flags_mutable_end_byte = 14,
         .control_block = 14, .source_offset_byte = 2,
@@ -579,6 +565,16 @@ static int worker_layout_matches(const struct worker_layout *layout) {
 }
 
 int mecha_detect_worker_layout(void) {
+    // MechaCon v1 (CXP101064) is NOT supported by this exploit.
+    // The SCMD 0x42 8-bit byte counter wraps at 256 bytes, making the
+    // worker area (located >280 bytes from buffer base) unreachable.
+    if (g_mecha_ver[1] == 1) {
+        log_printf("[CONFIG] MechaCon v1.%02d is NOT supported by the SCMD 0x40/0x42 exploit.\n", g_mecha_ver[2]);
+        log_printf("[CONFIG] The worker area is beyond the 256-byte hardware write limit.\n");
+        g_detected_worker_layout = -1;
+        return -1;
+    }
+
     int match_index = -1;
     for (int i = 0; i < WORKER_LAYOUT_COUNT; i++) {
         if (worker_layout_matches(&known_worker_layouts[i])) {
@@ -592,13 +588,9 @@ int mecha_detect_worker_layout(void) {
 
     if (match_index == -1) {
         // Safe fallback using firmware version and chip generation
-        if (g_mecha_ver[1] == 1 && g_mecha_ver[2] <= 3) {
-            // CXP101064 (v1.02, v1.03): QFP v1 with 0x1956 base
-            match_index = LAYOUT_V1_CXP101064; // 3
-        } else if ((g_mecha_ver[1] == 1 && g_mecha_ver[2] >= 6) ||
-                   (g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2)) {
-            // Early CXP102064 (v1.06..v1.08, v2.02): 0x1940 base with 0x1A0C worker
-            match_index = LAYOUT_EARLY_CXP102064; // 4
+        if (g_mecha_ver[1] == 2 && g_mecha_ver[2] <= 2) {
+            // Early CXP102064 (v2.02): 0x1940 base with 0x1A0C worker
+            match_index = LAYOUT_EARLY_CXP102064; // 3
         } else if (g_mecha_ver[1] >= 3 || (g_mecha_ver[1] == 2 && g_mecha_ver[2] >= 14)) {
             match_index = LAYOUT_V3_MARKER_00; // 1
         } else {
@@ -975,103 +967,6 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
 
     mecha_clean_overflow_ram();
 
-    return 0;
-}
-
-int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct worker_flush_diff *diff) {
-    if (!pre_ram256 || !post_ram256) return -1;
-    if (diff) memset(diff, 0, sizeof(*diff));
-
-    // Step 1: Read baseline RAM (16 blocks = 256 bytes) via SCMD 0x40 (read) + 16x SCMD 0x41
-    u8 st = 0;
-    int err1 = mecha_read_ram_probe_blocks(region, 16, 16, pre_ram256, &st);
-    if (err1 != 0 || st != 0x00) {
-        log_printf("[FLUSH_PROBE] Failed to read baseline RAM for region %d: err=%d, stat=0x%02X\n", region, err1, st);
-        return -1;
-    }
-    mecha_delay(2000);
-
-    // Step 2: Open region in WRITE mode with count = 4 blocks (the 4 original blocks)
-    st = 0;
-    int ret = mecha_open_config(1, region, 4, &st);
-    if (ret != 0 || st != 0x00) {
-        log_printf("[FLUSH_PROBE] SCMD 0x40 open (write, reg %d, count 4) failed: ret=%d, stat=0x%02X\n", region, ret, st);
-        mecha_close_config(&st);
-        return -2;
-    }
-
-    // Step 3: Write the 4 original blocks
-    for (int b = 0; b < 4; b++) {
-        u8 blk[16];
-        memcpy(blk, &pre_ram256[b * 16], 16);
-        u8 wr_st = 0;
-        int wr_ret = mecha_write_config(blk, &wr_st);
-        if (wr_ret != 0 || wr_st != 0x00) {
-            log_printf("[FLUSH_PROBE] Block %d write failed: ret=%d, stat=0x%02X\n", b, wr_ret, wr_st);
-            mecha_close_config(&st);
-            return -3;
-        }
-        mecha_delay(200);
-    }
-
-    // On block 3, count reaches 0 -> firmware executes Config_Flush_To_NVRAM_Worker!
-    // Wait for worker completion via delay + SCMD 0x40 polling
-    int flushed = 0;
-    for (int r = 0; r < 200; r++) {
-        u8 chk_st = 0xFF;
-        mecha_open_config(0, region, 0, &chk_st);
-        if (chk_st == 0x00) {
-            mecha_close_config(&chk_st);
-            flushed = 1;
-            break;
-        }
-        mecha_close_config(&chk_st);
-        mecha_delay(5000);
-    }
-    mecha_close_config(&st);
-    mecha_delay(5000);
-
-    if (!flushed) {
-        log_printf("[FLUSH_PROBE] Region %d worker flush timed out after 200 retries; results would be unreliable\n", region);
-        return -5;
-    }
-
-    // Step 4: Immediately read post-flush RAM (256 bytes)
-    int err2 = mecha_read_ram_probe_blocks(region, 16, 16, post_ram256, &st);
-    if (err2 != 0 || st != 0x00) {
-        log_printf("[FLUSH_PROBE] Failed to read post-flush RAM: err=%d, stat=0x%02X\n", err2, st);
-        return -4;
-    }
-
-    // Step 5: Diff pre vs post
-    int total_changed = 0;
-    int overflow_changed = 0;
-    u16 base_ram = (region == 0) ? 0x1890 : (region == 1 ? 0x18D0 : 0x1940);
-    for (int i = 0; i < 256; i++) {
-        if (pre_ram256[i] != post_ram256[i]) {
-            total_changed++;
-            if (i >= 112) overflow_changed++;
-            u16 ram_addr = base_ram + i;
-            log_printf("[FLUSH_DIFF] Reg %d RAM 0x%04X (blk %d, byte %d): 0x%02X -> 0x%02X\n",
-                       region, ram_addr, i / 16, i % 16, pre_ram256[i], post_ram256[i]);
-            if (diff) {
-                if (post_ram256[i] == 0x01 || post_ram256[i] == 0x02 || post_ram256[i] == 0x03) {
-                    diff->flags_detected_offset = ram_addr;
-                }
-            }
-        }
-    }
-
-    if (diff) {
-        diff->total_changed_bytes = total_changed;
-        diff->overflow_changed_bytes = overflow_changed;
-        snprintf(diff->summary, sizeof(diff->summary),
-                 "Region %d flush completed. %d bytes modified (overflow: %d).",
-                 region, total_changed, overflow_changed);
-    }
-
-    log_printf("[FLUSH_PROBE] Region %d flush finished: %d bytes changed (overflow: %d).\n",
-               region, total_changed, overflow_changed);
     return 0;
 }
 

@@ -22,7 +22,10 @@
 //                                 Byte 14 = Worker state (0x1A0E, 0x01=WREN start)
 //   Block 13     (0x1A10-0x1A1F): Bytes 0-1 = Target NVRAM word address (0x1A10, 16-bit LE)
 // Note: Relative offset from buffer base to worker fields is invariant (0xB6 bytes = 182 bytes)
-// across v1 (base 0x1956), v2 (base 0x1940), and v3 (base 0x1906).
+// across v2 (base 0x1940) and v3 (base 0x1906).
+// WARNING: MechaCon v1 (CXP101064, 1.02..1.08) is NOT supported by this exploit.
+// The SCMD 0x42 byte counter is 8-bit and wraps at 256 bytes, making the worker
+// area (located >280 bytes from buffer base on v1) physically unreachable.
 
 #define CONFIG_REGION2_BUFFER_START  0x1940
 #define CONFIG_REGION2_VALID_BLOCKS  7
@@ -99,13 +102,13 @@ void mecha_delay(int iterations);
 int mecha_query_scmd03_subcmd(u8 subcmd, u8 *out16, u8 *status);
 
 // Worker layout specification matching verified SPC970-MechaLIBerator
-#define WORKER_LAYOUT_COUNT          5
+// Supported: v2 (CXP102064, 2.02..2.14) and v3 (CXP103049, 3.00..3.06)
+// NOT supported: v1 (CXP101064, 1.02..1.08) — worker area unreachable (8-bit counter)
+#define WORKER_LAYOUT_COUNT          4
 #define LAYOUT_STANDARD_V2           0  // standard-fields (v2: CXP102064 2.04..2.14, base 0x1940, worker at 0x19F6)
 #define LAYOUT_V3_MARKER_00          1  // fields-2-bytes-earlier (v3: CXP103049 marker 00)
 #define LAYOUT_V3_MARKER_01          2  // shifted-marker-01-pointer-at-6 (v3: CXP103049 marker 01)
-#define LAYOUT_V1_CXP101064          3  // cxp101064-qfp-v1 (v1.02..v1.03: CXP101064 QFP, base 0x1940, worker at 0x1A0C)
-#define LAYOUT_EARLY_CXP102064       4  // early-cxp102064-v1v2 (v1.06..v1.08, v2.02: CXP102064, base 0x1940, worker at 0x1A0C)
-#define LAYOUT_V1_EARLY_V2           LAYOUT_V1_CXP101064  // Compatibility alias
+#define LAYOUT_EARLY_CXP102064       3  // early-cxp102064-v2.02 (CXP102064-005R, base 0x1940, worker at 0x1A0C)
 
 struct worker_layout {
     const char *name;
@@ -137,7 +140,8 @@ int mecha_clean_overflow_ram(void);
 
 // Automatically detect worker layout from buffered config window:
 // Returns: 0 = standard-fields (v2), 1 = fields-2-bytes-earlier (v3 marker 00),
-//          2 = shifted-marker-01-pointer-at-6 (v3 marker 01), 3 = early-v1-v202-fields (v1/v2.02)
+//          2 = shifted-marker-01-pointer-at-6 (v3 marker 01), 3 = early-cxp102064-v2.02
+// Returns -1 if firmware is unsupported (v1.xx)
 int mecha_detect_worker_layout(void);
 
 const struct worker_layout *mecha_get_layout(int layout_index);
@@ -150,7 +154,7 @@ extern int g_detected_worker_layout;
 // rom_source_addr: 24-bit ROM address to read from (e.g. 0xFC0000)
 // nvram_word_start: first EEPROM word to stage data into (e.g. 0, 128, 256, 384)
 // nvram_word_count: number of 16-bit words (e.g. 128)
-// layout_mode: layout index (0 = standard, 1 = BGA2 marker 00, 2 = BGA2 marker 01, 3 = early v1/v202)
+// layout_mode: layout index (0 = standard, 1 = BGA2 marker 00, 2 = BGA2 marker 01, 3 = early v2.02)
 // Returns 0 on success, negative on error.
 int mecha_exploit_stage_chunk(u32 rom_source_addr, u16 nvram_word_start, u16 nvram_word_count, int layout_mode);
 
@@ -164,17 +168,5 @@ int mecha_read_staged_data(u16 nvram_word_start, u16 nvram_word_count, u8 *out_b
 // rom_buf must be at least ROM_SIZE_BYTES.
 int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, ProgressCallback cb);
 
-// Diagnostic structure for worker flush observation
-struct worker_flush_diff {
-    int total_changed_bytes;
-    int overflow_changed_bytes;
-    u16 flags_detected_offset;
-    u16 ptr_detected_offset;
-    u16 dest_detected_offset;
-    char summary[256];
-};
-
-// Perform a safe hardware-native 4-block flush to observe MechaCon internal worker pointers
-int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct worker_flush_diff *diff);
 
 #endif // MECHA_H

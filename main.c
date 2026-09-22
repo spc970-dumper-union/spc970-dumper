@@ -449,26 +449,6 @@ static void update_dump_directory(void) {
              g_dump_dir);
 }
 
-static void print_hex_block(u16 base_addr, const u8 *data, int len) {
-  for (int i = 0; i < len; i += 16) {
-    scr_printf(" %04X: ", base_addr + i);
-    for (int j = 0; j < 16; j++) {
-      if (i + j < len)
-        scr_printf("%02X ", data[i + j]);
-      else
-        scr_printf("   ");
-    }
-    scr_printf("|");
-    for (int j = 0; j < 16; j++) {
-      if (i + j < len) {
-        u8 b = data[i + j];
-        char c = (b >= 32 && b <= 126) ? (char)b : '.';
-        scr_printf("%c", c);
-      }
-    }
-    scr_printf("|\n");
-  }
-}
 
 // Menu 1: Display Full Console & MechaCon Info
 static void show_system_info(void) {
@@ -627,402 +607,9 @@ static void backup_nvram_action(void) {
   wait_for_cross();
 }
 
-// Menu 3: Probe Config Overflow & RAM Snapshot (diagnostic)
-static void probe_config_overflow_action(void) {
-  scr_clear();
-  scr_printf("=====================================================\n");
-  scr_printf("      MechaCon RAM Snapshot & Overflow Diagnostic    \n");
-  scr_printf("=====================================================\n\n");
 
-  log_printf("[PROBE] Starting safe read-only RAM snapshot...\n");
-  scr_printf(" [*] Step 1: Performing 256-byte Read-Only RAM Snapshot...\n");
-  scr_printf(
-      "     SCMD 0x40 (read mode 0, region 2, 16 blocks) -> 16x SCMD 0x41\n");
 
-  u8 probe256[256];
-  memset(probe256, 0, sizeof(probe256));
-  u8 probe_stat = 0;
-  int read_errs = mecha_read_ram_probe(2, 16, probe256, &probe_stat);
-
-  if (read_errs < 0) {
-    scr_printf(
-        " [-] Failed to open config region for reading (stat: 0x%02X)\n\n",
-        probe_stat);
-    log_printf("[PROBE] Failed to open config session: stat=0x%02X\n",
-               probe_stat);
-  } else {
-    scr_printf(" [+] Snapshot acquired! (%d block read errors)\n", read_errs);
-    log_printf("[PROBE] 256-byte RAM snapshot read with %d errors\n",
-               read_errs);
-
-    // Analyze blocks 8-15
-    int non_zero_overflow = 0;
-    for (int i = 112; i < 256; i++) {
-      if (probe256[i] != 0)
-        non_zero_overflow++;
-    }
-
-    if (non_zero_overflow == 0) {
-      scr_printf(
-          " [!] BLOCKS 8-15 ARE ALL ZEROES (Signature of CXP101064 / 10K!)\n");
-      scr_printf(
-          "     EEPROM worker fields are NOT at offset +0xB0 in this chip.\n");
-      log_printf("[PROBE] Diagnosis: Blocks 8-15 all zero (CXP101064 / MD 1.36 "
-                 "layout)\n");
-    } else {
-      scr_printf(" [+] Active RAM structures detected in overflow region (+%d "
-                 "bytes)!\n",
-                 non_zero_overflow);
-      scr_printf("     Matches CXP102064 / CXP103049 layout signature.\n");
-      log_printf(
-          "[PROBE] Diagnosis: Active RAM structures found in overflow area\n");
-      scr_printf(" Worker region preview (Blocks 11-12):\n");
-      print_hex_block(0x00B0, &probe256[0xB0], 32);
-    }
-
-    // Save PROBE00.BIN and PROBE00.TXT
-    update_dump_directory();
-    char probe_bin[256], probe_txt[256];
-    snprintf(probe_bin, sizeof(probe_bin), "%s/PROBE00.BIN", g_dump_dir);
-    snprintf(probe_txt, sizeof(probe_txt), "%s/PROBE00.TXT", g_dump_dir);
-
-    int fd = open(probe_bin, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-      int wr_ok = (write_checked(fd, probe256, sizeof(probe256), probe_bin) == 0);
-      close(fd);
-      if (wr_ok) {
-        scr_printf(" [+] Saved RAM snapshot: %s\n", probe_bin);
-        log_printf("[FILE] Saved %s\n", probe_bin);
-      } else {
-        scr_printf(" [!] Warning: %s may be truncated!\n", probe_bin);
-      }
-    }
-
-    FILE *ft = fopen(probe_txt, "w");
-    if (ft) {
-      fprintf(ft, "SPC970 RAM PROBE SNAPSHOT\n");
-      fprintf(ft, "raw_scmd_03_00=%02X %02X %02X %02X\n", g_mecha_ver[0],
-              g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[3]);
-      fprintf(ft, "probe_bytes=256\n");
-      fprintf(ft, "overflow_active_bytes=%d\n", non_zero_overflow);
-      fclose(ft);
-    }
-  }
-
-  // Also take an extended 512-byte snapshot (32 blocks) to find where CXP101064
-  // worker is
-  scr_printf("\n [*] Step 2: Extended 512-byte RAM Snapshot (32 blocks)...\n");
-  u8 probe512[512];
-  memset(probe512, 0, sizeof(probe512));
-  read_errs = mecha_read_ram_probe(2, 32, probe512, &probe_stat);
-  if (read_errs >= 0) {
-    char ext_bin[256];
-    snprintf(ext_bin, sizeof(ext_bin), "%s/PROBE_EXT512.BIN", g_dump_dir);
-    int fd_ext = open(ext_bin, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd_ext >= 0) {
-      int wr_ok = (write_checked(fd_ext, probe512, sizeof(probe512), ext_bin) == 0);
-      close(fd_ext);
-      if (wr_ok) {
-        scr_printf(" [+] Saved extended snapshot: %s\n", ext_bin);
-        log_printf("[FILE] Saved %s\n", ext_bin);
-      } else {
-        scr_printf(" [!] Warning: %s may be truncated!\n", ext_bin);
-      }
-    }
-  }
-
-  // Step 3: Test SCMD 0x42 Write Acceptance (bounds test)
-  scr_printf("\n [*] Step 3: Testing SCMD 0x42 overflow write acceptance...\n");
-  u8 open_stat = 0xFF;
-  int ret = mecha_open_config(1, 2, 0, &open_stat);
-  if (ret != 0) {
-    u8 close_st = 0;
-    mecha_close_config(&close_st);
-    ret = mecha_open_config(1, 2, 0, &open_stat);
-  }
-  scr_printf(" SCMD 0x40 open (write, reg 2, count 0): stat=0x%02X\n",
-             open_stat);
-  log_printf(
-      "[PROBE] SCMD 0x40 open (write, reg 2, count 0): ret=%d, stat=0x%02X\n",
-      ret, open_stat);
-
-  if (ret == 0) {
-    u8 test_block[16];
-    memset(test_block, 0, 16);
-    u8 wr_stat = 0xFF;
-
-    // Block 0
-    int w0 = mecha_write_config(test_block, &wr_stat);
-    scr_printf(" SCMD 0x42 Block 0 write: ret=%d stat=0x%02X\n", w0, wr_stat);
-    log_printf("[PROBE] SCMD 0x42 Block 0 write: ret=%d stat=0x%02X\n", w0,
-               wr_stat);
-
-    // Blocks 1 to 6
-    for (int b = 1; b <= 6; b++) {
-      mecha_write_config(test_block, &wr_stat);
-    }
-
-    // Block 7 (first overflow block past 0x70 valid buffer)
-    // Must preserve 0xFF, 0x67 in bytes 0-1 so 0x19B0 state flag is retained!
-    u8 blk7[16] = {0};
-    blk7[0] = 0xFF;
-    blk7[1] = 0x67;
-    int w7 = mecha_write_config(blk7, &wr_stat);
-    scr_printf(" SCMD 0x42 Block 7 (Overflow): ret=%d stat=0x%02X\n", w7,
-               wr_stat);
-    log_printf("[PROBE] SCMD 0x42 Block 7 (Overflow): ret=%d stat=0x%02X\n", w7,
-               wr_stat);
-    if (wr_stat == 0x00) {
-      scr_printf(
-          " [+] OVERFLOW WRITES ACCEPTED! Hardware has no bounds check.\n");
-      log_printf("[PROBE] Overflow writes accepted (no bounds check)\n");
-    } else {
-      scr_printf(
-          " [-] OVERFLOW WRITE REJECTED! Hardware returned error 0x%02X.\n",
-          wr_stat);
-      log_printf("[PROBE] Overflow write rejected: stat=0x%02X\n", wr_stat);
-    }
-
-    u8 close_stat = 0;
-    mecha_close_config(&close_stat);
-    log_printf("[PROBE] SCMD 0x43 close: stat=0x%02X\n", close_stat);
-  } else {
-    log_printf("[PROBE] SCMD 0x40 write mode 1 rejected: stat=0x%02X\n",
-               open_stat);
-  }
-
-  char log_path[256];
-  snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
-  log_save_to_file(log_path);
-
-  wait_for_cross();
-}
-
-// Menu 4: Safe Hardware Diagnostic & RAM Mapping (All Regions & Target SCMDs)
-static void full_hardware_mapping_action(void) {
-  scr_clear();
-  scr_printf("=====================================================\n");
-  scr_printf("   MechaCon Hardware Diagnostic & Safe RAM Mapping   \n");
-  scr_printf("=====================================================\n\n");
-
-  log_printf("[MAP] Starting safe hardware and RAM mapping (Regions 0-7 & Target SCMDs)...\n");
-  update_dump_directory();
-
-  // 1. Ensure NVRAM backup
-  if (!g_nvram_backed_up) {
-    scr_printf(" [*] Step 1/4: Backing up NVRAM (1024 Bytes)...\n");
-    int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
-    if (read_errs == 0) {
-      g_nvram_backed_up = 1;
-      g_serial = extract_serial_from_nvram(g_nvram_backup, &g_emcs);
-      g_model_id = extract_model_id_from_nvram(g_nvram_backup);
-      update_dump_directory();
-    }
-    char nvram_path[256];
-    snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
-    int fd = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) {
-      if (write_checked(fd, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path) == 0) {
-        log_printf("[FILE] Successfully saved %s\n", nvram_path);
-      }
-      close(fd);
-    }
-  } else {
-    scr_printf(" [*] Step 1/4: NVRAM already backed up.\n");
-  }
-
-  // 2. Scan Config Regions 0..7 safely (Dump whatever responds, skip unopened cleanly)
-  scr_printf("\n [*] Step 2/4: Scanning Config Regions 0 through 7...\n");
-
-  struct region_scan_result {
-    int supported_std;
-    int supported_uf;
-    u8 stat_std;
-    u8 stat_uf;
-    int non_zero_low;
-    int non_zero_overflow;
-    int potential_rom_ptrs;
-  } reg_results[8];
-  memset(reg_results, 0, sizeof(reg_results));
-
-  for (int r = 0; r < 8; r++) {
-    // Standard read: 4 blocks (64 bytes)
-    u8 buf64[64];
-    memset(buf64, 0, sizeof(buf64));
-    u8 st_std = 0xFF;
-    int err_std = mecha_read_ram_probe_blocks((u8)r, 4, 4, buf64, &st_std);
-    if (err_std == 0 && st_std == 0x00) {
-      reg_results[r].supported_std = 1;
-      reg_results[r].stat_std = st_std;
-      char path64[256];
-      snprintf(path64, sizeof(path64), "%s/REGION%d_STD64.BIN", g_dump_dir, r);
-      int fd = open(path64, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-      if (fd >= 0) {
-        write_checked(fd, buf64, sizeof(buf64), path64);
-        close(fd);
-      }
-
-      mecha_delay(2000);
-
-      // 16 blocks (256 bytes) read with explicit block count = 16 (prevents bus hangs)
-      u8 buf256[256];
-      memset(buf256, 0, sizeof(buf256));
-      u8 st_uf = 0xFF;
-      int err_uf = mecha_read_ram_probe_blocks((u8)r, 16, 16, buf256, &st_uf);
-      if (err_uf == 0 && st_uf == 0x00) {
-        reg_results[r].supported_uf = 1;
-        reg_results[r].stat_uf = st_uf;
-        for (int i = 0; i < 112; i++) {
-          if (buf256[i] != 0)
-            reg_results[r].non_zero_low++;
-        }
-        for (int i = 112; i < 256; i++) {
-          if (buf256[i] != 0)
-            reg_results[r].non_zero_overflow++;
-        }
-        for (int i = 0; i <= 256 - 4; i++) {
-          u32 val = buf256[i] | (buf256[i + 1] << 8) | (buf256[i + 2] << 16);
-          if ((val >= 0xFC0000 && val <= 0xFFFFFF) ||
-              (val >= 0xFD0000 && val <= 0xFFFFFF)) {
-            reg_results[r].potential_rom_ptrs++;
-          }
-        }
-        char path256[256];
-        snprintf(path256, sizeof(path256), "%s/REGION%d_RAM256.BIN", g_dump_dir, r);
-        int fd = open(path256, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-        if (fd >= 0) {
-          write_checked(fd, buf256, sizeof(buf256), path256);
-          close(fd);
-        }
-      }
-    } else {
-      reg_results[r].stat_std = st_std;
-    }
-
-    scr_printf("  Region %d: std=%s (stat 0x%02X) | 256B=%s [NZ low:%d, over:%d, ptrs:%d]\n",
-               r, reg_results[r].supported_std ? "OK" : "--", st_std,
-               reg_results[r].supported_uf ? "OK" : "--",
-               reg_results[r].non_zero_low, reg_results[r].non_zero_overflow,
-               reg_results[r].potential_rom_ptrs);
-    log_printf("[MAP] Region %d: std=%d (stat=0x%02X), 256B=%d (stat=0x%02X), low_nz=%d, over_nz=%d, ptrs=%d\n",
-               r, reg_results[r].supported_std, st_std,
-               reg_results[r].supported_uf, reg_results[r].stat_uf,
-               reg_results[r].non_zero_low, reg_results[r].non_zero_overflow,
-               reg_results[r].potential_rom_ptrs);
-
-    mecha_delay(2000);
-  }
-
-  // 3. Query Target Safe Diagnostic SCMDs (No blind sweeps, no motor/laser subcommands)
-  scr_printf("\n [*] Step 3/4: Querying Target Diagnostic SCMDs (Safe Set)...\n");
-  char scmd_rpt_path[256];
-  snprintf(scmd_rpt_path, sizeof(scmd_rpt_path), "%s/TARGET_SCMD_REPORT.TXT", g_dump_dir);
-  FILE *fp_scmd = fopen(scmd_rpt_path, "w");
-  if (fp_scmd) {
-    fprintf(fp_scmd, "=== Target Safe SCMD Diagnostics ===\n");
-    fprintf(fp_scmd, "MechaCon: v%d.%02d (Reg 0x%02X, Rev 0x%02X) | Chip: %s\n\n",
-            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], g_mecha_ver[3],
-            get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
-  }
-
-  struct target_scmd_probe {
-    const char *name;
-    u8 cmd;
-    u8 in_len;
-    u8 in_bytes[4];
-    u8 exp_out_len;
-  } target_cmds[] = {
-    { "SCMD 0x01    (Drive Status)", 0x01, 0, { 0x00 }, 1 },
-    { "SCMD 0x03-00 (MechaCon Ver)", 0x03, 1, { 0x00 }, 4 },
-    { "SCMD 0x03-01 (DSP Version)",   0x03, 1, { 0x01 }, 1 },
-    { "SCMD 0x03-45 (Console ID)",   0x03, 1, { 0x45 }, 8 },
-    { "SCMD 0x08    (Hardware RTC)", 0x08, 0, { 0x00 }, 8 },
-    { "SCMD 0x0A    (Read NVM w0)",  0x0A, 2, { 0x00, 0x00 }, 3 },
-    { "SCMD 0x12    (i.Link ID)",    0x12, 0, { 0x00 }, 8 },
-  };
-  int num_target_cmds = sizeof(target_cmds) / sizeof(target_cmds[0]);
-
-  for (int i = 0; i < num_target_cmds; i++) {
-    u8 out[16] = {0};
-    int ret = sceCdApplySCmd(target_cmds[i].cmd, target_cmds[i].in_bytes, target_cmds[i].in_len, out);
-    scr_printf("  %-28s: ret=%d (stat=0x%02X)\n", target_cmds[i].name, ret, out[0]);
-    log_printf("[MAP_SCMD] %s: ret=%d | %02X %02X %02X %02X %02X %02X %02X %02X\n",
-               target_cmds[i].name, ret, out[0], out[1], out[2], out[3], out[4], out[5], out[6], out[7]);
-    if (fp_scmd) {
-      fprintf(fp_scmd, "%-28s: ret=%d | ", target_cmds[i].name, ret);
-      for (int k = 0; k < target_cmds[i].exp_out_len; k++) {
-        fprintf(fp_scmd, "%02X ", out[k]);
-      }
-      fprintf(fp_scmd, "\n");
-    }
-    mecha_delay(5000); // 5ms safe delay between SCMDs
-  }
-  if (fp_scmd) fclose(fp_scmd);
-  scr_printf("  Target SCMD queries completed safely.\n");
-
-  // 4. Generate Comprehensive Mapping Report
-  scr_printf("\n [*] Step 4/4: Compiling MECHA_MAP_REPORT.TXT...\n");
-  char rpt_path[256];
-  snprintf(rpt_path, sizeof(rpt_path), "%s/MECHA_MAP_REPORT.TXT", g_dump_dir);
-  FILE *fr = fopen(rpt_path, "w");
-  if (fr) {
-    fprintf(fr, "=====================================================\n");
-    fprintf(fr, "      MechaCon Hardware & RAM Mapping Report         \n");
-    fprintf(fr, "=====================================================\n\n");
-    fprintf(fr, "Model Name (SCMD 0x17): %s\n", g_cdvd_model);
-    fprintf(fr, "MechaCon Chip Part No : %s\n", get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
-    fprintf(fr, "MechaCon Version      : MD 1.39 v%d.%02d (Region: 0x%02X [%s%s], Rev 0x%02X)\n",
-            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], get_region_name(g_mecha_ver[0]),
-            (g_mecha_ver[0] == 0x80 || g_mecha_ver[0] == 0x81) ? " / DEX" : "",
-            g_mecha_ver[3]);
-    fprintf(fr, "DSP Version (0x03-01) : 0x%02X\n", g_dsp_ver);
-    fprintf(fr, "BIOS ROMVER           : %s\n", g_romver);
-    fprintf(fr, "Model ID (NVRAM)      : 0x%04X (%s)\n", g_model_id, get_model_id_desc(g_model_id));
-    fprintf(fr, "Serial Number (NVRAM) : %07u (EMCS: 0x%02X)\n\n", g_serial, g_emcs);
-
-    fprintf(fr, "--- Config Regions Sweep (SCMD 0x40 / 0x41) ---\n");
-    fprintf(fr, "Region | Std 4-Blk | 256-Byte Read | Low Non-Zero | Overflow Non-Zero | ROM Pointers\n");
-    fprintf(fr, "-------+-----------+---------------+--------------+-------------------+-------------\n");
-    for (int r = 0; r < 8; r++) {
-      fprintf(fr, "  %2d   |    %s     |      %s      |     %3d      |        %3d        |     %3d\n",
-              r,
-              reg_results[r].supported_std ? "OK" : "--",
-              reg_results[r].supported_uf ? "OK" : "--",
-              reg_results[r].non_zero_low,
-              reg_results[r].non_zero_overflow,
-              reg_results[r].potential_rom_ptrs);
-    }
-    fprintf(fr, "\n--- Diagnostic Findings ---\n");
-    int best_region = -1;
-    int max_over = 0;
-    for (int r = 0; r < 8; r++) {
-      if (reg_results[r].non_zero_overflow > max_over) {
-        max_over = reg_results[r].non_zero_overflow;
-        best_region = r;
-      }
-    }
-    if (best_region >= 0 && max_over > 0) {
-      fprintf(fr, "[+] Active overflow structures found in Region %d (+%d bytes)!\n", best_region, max_over);
-      fprintf(fr, "    This region is the primary candidate for worker parameters and ROM staging.\n");
-    } else {
-      fprintf(fr, "[!] No standard overflow structures detected in probed regions.\n");
-      fprintf(fr, "    Worker is either isolated, dynamically armed, or uses dedicated command.\n");
-    }
-    fclose(fr);
-    scr_printf(" [+] Report generated: %s\n", rpt_path);
-    log_printf("[MAP] Report written to %s\n", rpt_path);
-  }
-
-  // Save debug log
-  char log_path_out[256];
-  snprintf(log_path_out, sizeof(log_path_out), "%s/DEBUG_LOG.TXT", g_dump_dir);
-  log_save_to_file(log_path_out);
-
-  scr_printf("\n[+] Diagnostic probe complete! All files saved to:\n    %s/\n", g_dump_dir);
-  wait_for_cross();
-}
-
-// Menu 5: Full Auto Dump & Verification
+// Full Auto Dump & Verification
 static void full_dump_and_verify_action(void) {
   scr_clear();
   scr_printf("=====================================================\n");
@@ -1030,6 +617,24 @@ static void full_dump_and_verify_action(void) {
   scr_printf("=====================================================\n\n");
 
   log_printf("[AUTO_DUMP] Full automated workflow initiated...\n");
+
+  // MechaCon v1 (CXP101064, 1.02..1.08) is NOT supported by this exploit.
+  // The SCMD 0x42 8-bit byte counter wraps at 256 bytes, making the worker
+  // area (located >280 bytes from buffer base on v1) physically unreachable.
+  if (g_mecha_ver[1] == 1) {
+    scr_printf(" [!] ERROR: MechaCon v1.%02d is NOT supported by this exploit!\n\n", g_mecha_ver[2]);
+    scr_printf("     The SCMD 0x42 byte counter is 8-bit and wraps at 256 bytes.\n");
+    scr_printf("     The EEPROM worker area on v1 hardware is located beyond the\n");
+    scr_printf("     256-byte write limit, making it physically unreachable.\n\n");
+    scr_printf("     Supported firmware: v2.02..v2.14 and v3.00..v3.06\n");
+    scr_printf("     Your firmware:      v%d.%02d (Chip: %s)\n\n",
+               g_mecha_ver[1], g_mecha_ver[2],
+               get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
+    log_printf("[AUTO_DUMP] REJECTED: MechaCon v1.%02d is unsupported (worker unreachable).\n",
+               g_mecha_ver[2]);
+    wait_for_cross();
+    return;
+  }
 
   if (!g_nvram_backed_up) {
     scr_printf(" [*] Step 1/4: Backing up NVRAM first for safety...\n");
@@ -1317,140 +922,115 @@ static void restore_nvram_action(void) {
   wait_for_cross();
 }
 
-// Menu 6: EEPROM Worker Discovery & Flush Diagnostics
-static void worker_flush_diagnostics_action(void) {
+// Restore NVRAM from USB file (mass:/NVRAM.BIN or mass:/path/NVRAM.BIN)
+static void restore_nvram_from_file_action(void) {
   scr_clear();
   scr_printf("=====================================================\n");
-  scr_printf("   EEPROM Worker Discovery & Flush Diagnostics      \n");
+  scr_printf("          Restore NVRAM from USB File (NVRAM.BIN)    \n");
   scr_printf("=====================================================\n\n");
 
-  log_printf("[DISCOVERY] Worker flush discovery action initiated...\n");
+  log_printf("[RESTORE_FILE] NVRAM restore from file initiated...\n");
 
-  // Step 1: Ensure NVRAM backup exists
-  if (!g_nvram_backed_up) {
-    scr_printf(" [*] Step 1/3: Backing up NVRAM first for safety...\n");
-    int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
-    // Only trust this buffer for a later restore if every word was actually read.
-    g_nvram_backed_up = (read_errs == 0);
-    if (read_errs > 0) {
-      log_printf("[WARN] NVRAM backup had %d word errors\n", read_errs);
-    }
-    g_serial = extract_serial_from_nvram(g_nvram_backup, &g_emcs);
-    g_model_id = extract_model_id_from_nvram(g_nvram_backup);
-    update_dump_directory();
+  // Try multiple paths: target dump dir first, then mass root
+  char try_paths[3][256];
+  int num_paths = 0;
+  snprintf(try_paths[num_paths++], sizeof(try_paths[0]), "%s/NVRAM.BIN", g_dump_dir);
+  snprintf(try_paths[num_paths++], sizeof(try_paths[0]), "mass:/NVRAM.BIN");
+  snprintf(try_paths[num_paths++], sizeof(try_paths[0]), "mass:NVRAM.BIN");
 
-    char nvram_path[256];
-    snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
-    int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd_nvm >= 0) {
-      write_checked(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path);
-      close(fd_nvm);
+  int fd = -1;
+  const char *found_path = NULL;
+  for (int i = 0; i < num_paths; i++) {
+    fd = open(try_paths[i], O_RDONLY);
+    if (fd >= 0) {
+      found_path = try_paths[i];
+      break;
     }
-  } else {
-    scr_printf(" [*] Step 1/3: NVRAM is already safely backed up.\n");
   }
 
-  update_dump_directory();
-
-  // Step 2: Region 2 Controlled Flush Test
-  scr_printf("\n [*] Step 2/3: Performing Region 2 (0x1940) Controlled Flush...\n");
-  scr_printf("     Writing 4 original blocks back to trigger internal worker...\n");
-
-  u8 pre_r2[256];
-  memset(pre_r2, 0, sizeof(pre_r2));
-  u8 post_r2[256];
-  memset(post_r2, 0, sizeof(post_r2));
-  struct worker_flush_diff diff_r2;
-  memset(&diff_r2, 0, sizeof(diff_r2));
-
-  int ret_r2 = mecha_worker_flush_probe(2, pre_r2, post_r2, &diff_r2);
-  if (ret_r2 == 0) {
-    scr_printf(" [+] Region 2 Flush Completed! Total RAM bytes changed: %d\n", diff_r2.total_changed_bytes);
-    scr_printf("     Overflow Area Changes (Blocks 8-15): %d bytes\n", diff_r2.overflow_changed_bytes);
-
-    if (diff_r2.flags_detected_offset > 0) {
-      scr_printf(" [!] WORKER FLAGS DETECTED AT RAM: 0x%04X!\n", diff_r2.flags_detected_offset);
+  if (fd < 0) {
+    scr_printf(" [-] ERROR: Could not find NVRAM.BIN on USB storage!\n\n");
+    scr_printf("     Searched:\n");
+    for (int i = 0; i < num_paths; i++) {
+      scr_printf("       %s\n", try_paths[i]);
     }
-
-    // Save PRE and POST binaries
-    char pre_path[256], post_path[256];
-    snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG2.BIN", g_dump_dir);
-    snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG2.BIN", g_dump_dir);
-    int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write_checked(fd, pre_r2, 256, pre_path); close(fd); }
-    fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write_checked(fd, post_r2, 256, post_path); close(fd); }
-  } else {
-    scr_printf(" [-] Region 2 Flush Probe failed with code %d\n", ret_r2);
+    scr_printf("\n     Please copy NVRAM.BIN to your USB drive and try again.\n");
+    log_printf("[RESTORE_FILE] NVRAM.BIN not found on any search path.\n");
+    wait_for_cross();
+    return;
   }
 
-  // Step 3: Region 1 Controlled Flush Test
-  scr_printf("\n [*] Step 3/3: Performing Region 1 (0x18D0) Controlled Flush...\n");
-  u8 pre_r1[256];
-  memset(pre_r1, 0, sizeof(pre_r1));
-  u8 post_r1[256];
-  memset(post_r1, 0, sizeof(post_r1));
-  struct worker_flush_diff diff_r1;
-  memset(&diff_r1, 0, sizeof(diff_r1));
+  // Read the file
+  u8 file_nvram[NVRAM_SIZE_BYTES];
+  ssize_t bytes_read = read(fd, file_nvram, NVRAM_SIZE_BYTES);
+  close(fd);
 
-  int ret_r1 = mecha_worker_flush_probe(1, pre_r1, post_r1, &diff_r1);
-  if (ret_r1 == 0) {
-    scr_printf(" [+] Region 1 Flush Completed! Total RAM bytes changed: %d\n", diff_r1.total_changed_bytes);
-    scr_printf("     Overflow Area Changes (Blocks 8-15): %d bytes\n", diff_r1.overflow_changed_bytes);
-
-    char pre_path[256], post_path[256];
-    snprintf(pre_path, sizeof(pre_path), "%s/FLUSH_PRE_REG1.BIN", g_dump_dir);
-    snprintf(post_path, sizeof(post_path), "%s/FLUSH_POST_REG1.BIN", g_dump_dir);
-    int fd = open(pre_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write_checked(fd, pre_r1, 256, pre_path); close(fd); }
-    fd = open(post_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd >= 0) { write_checked(fd, post_r1, 256, post_path); close(fd); }
-  } else {
-    scr_printf(" [-] Region 1 Flush Probe failed with code %d\n", ret_r1);
+  if (bytes_read != NVRAM_SIZE_BYTES) {
+    scr_printf(" [-] ERROR: NVRAM.BIN is %ld bytes, expected exactly %d bytes!\n",
+               (long)bytes_read, NVRAM_SIZE_BYTES);
+    scr_printf("     File may be corrupt or incomplete. Aborting.\n");
+    log_printf("[RESTORE_FILE] File size mismatch: got %ld, expected %d.\n",
+               (long)bytes_read, NVRAM_SIZE_BYTES);
+    wait_for_cross();
+    return;
   }
 
-  // Generate WORKER_DISCOVERY.TXT report
-  char rpt_path[256];
-  snprintf(rpt_path, sizeof(rpt_path), "%s/WORKER_DISCOVERY.TXT", g_dump_dir);
-  FILE *fr = fopen(rpt_path, "w");
-  if (fr) {
-    fprintf(fr, "=====================================================\n");
-    fprintf(fr, "      MechaCon EEPROM Worker Discovery Report        \n");
-    fprintf(fr, "=====================================================\n\n");
-    fprintf(fr, "MechaCon Chip Part No : %s\n", get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
-    fprintf(fr, "MechaCon Version      : MD 1.39 v%d.%02d (Region: 0x%02X, Rev 0x%02X)\n\n",
-            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], g_mecha_ver[3]);
-    fprintf(fr, "--- Region 2 Flush (Base: 0x1940) ---\n");
-    fprintf(fr, "Outcome         : %s\n", (ret_r2 == 0) ? "SUCCESS" : "FAILED");
-    fprintf(fr, "Total Changes   : %d bytes\n", diff_r2.total_changed_bytes);
-    fprintf(fr, "Overflow Changes: %d bytes (Blocks 8-15: 0x19C0-0x1A3F)\n", diff_r2.overflow_changed_bytes);
-    for (int i = 0; i < 256; i++) {
-      if (pre_r2[i] != post_r2[i]) {
-        fprintf(fr, "  RAM 0x%04X (blk %2d, byte %2d): 0x%02X -> 0x%02X\n",
-                0x1940 + i, i / 16, i % 16, pre_r2[i], post_r2[i]);
+  scr_printf(" [+] Found: %s (%d bytes)\n\n", found_path, NVRAM_SIZE_BYTES);
+  log_printf("[RESTORE_FILE] Loaded %s (%d bytes)\n", found_path, NVRAM_SIZE_BYTES);
+
+  // Decode Serial and Model ID from file for confirmation
+  u8 file_emcs = 0;
+  u32 file_serial = extract_serial_from_nvram(file_nvram, &file_emcs);
+  u16 file_model_id = extract_model_id_from_nvram(file_nvram);
+  scr_printf(" File NVRAM Serial : %07u (EMCS: 0x%02X)\n", file_serial, file_emcs);
+  scr_printf(" File Model ID     : 0x%04X (%s)\n\n", file_model_id, get_model_id_desc(file_model_id));
+
+  scr_printf(" [!] WARNING: This will overwrite ALL 512 EEPROM words!\n");
+  scr_printf("     Press CROSS (X) to proceed, TRIANGLE to cancel.\n");
+  log_printf("[RESTORE_FILE] Waiting for user confirmation...\n");
+
+  if (g_headless) {
+    scr_printf("\n >> [HEADLESS] Auto-proceeding...\n");
+  } else {
+    while (1) {
+      u32 btn = read_pad_click();
+      if (btn & PAD_CROSS) break;
+      if (btn & PAD_TRIANGLE) {
+        scr_printf("\n [-] Cancelled by user. No changes made.\n");
+        log_printf("[RESTORE_FILE] Cancelled by user.\n");
+        wait_for_cross();
+        return;
       }
+      for (volatile int d = 0; d < 10000; d++);
     }
+  }
 
-    fprintf(fr, "\n--- Region 1 Flush (Base: 0x18D0) ---\n");
-    fprintf(fr, "Outcome         : %s\n", (ret_r1 == 0) ? "SUCCESS" : "FAILED");
-    fprintf(fr, "Total Changes   : %d bytes\n", diff_r1.total_changed_bytes);
-    fprintf(fr, "Overflow Changes: %d bytes\n", diff_r1.overflow_changed_bytes);
-    for (int i = 0; i < 256; i++) {
-      if (pre_r1[i] != post_r1[i]) {
-        fprintf(fr, "  RAM 0x%04X (blk %2d, byte %2d): 0x%02X -> 0x%02X\n",
-                0x18D0 + i, i / 16, i % 16, pre_r1[i], post_r1[i]);
-      }
-    }
-    fclose(fr);
-    scr_printf("\n [+] Telemetry report saved: %s\n", rpt_path);
-    log_printf("[DISCOVERY] Report saved to %s\n", rpt_path);
+  scr_printf("\n [*] Writing 512 words to MechaCon EEPROM via SCMD 0x0B...\n");
+  int write_errs = mecha_restore_nvram(file_nvram, draw_progress_bar);
+  if (write_errs > 0) {
+    log_printf("[WARN] File restore had %d write errors\n", write_errs);
+  }
+
+  scr_printf("\n [*] Verifying restored data...\n");
+  int mismatches = mecha_verify_nvram(file_nvram, draw_progress_bar);
+  log_printf("[RESTORE_FILE] Verification: %d mismatches.\n", mismatches);
+
+  if (mismatches == 0) {
+    scr_printf("\n[+] SUCCESS: NVRAM restored and verified! 100%% match with file.\n");
+    // Update in-memory backup to match
+    memcpy(g_nvram_backup, file_nvram, NVRAM_SIZE_BYTES);
+    g_nvram_backed_up = 1;
+    g_serial = file_serial;
+    g_emcs = file_emcs;
+    g_model_id = file_model_id;
+  } else {
+    scr_printf("\n[-] WARNING: %d word mismatches detected after restore!\n", mismatches);
   }
 
   char log_path[256];
   snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
   log_save_to_file(log_path);
 
-  scr_printf(" [+] Flush discovery complete! All files saved to USB:\n    %s/\n", g_dump_dir);
   wait_for_cross();
 }
 
@@ -1480,7 +1060,7 @@ static void save_debug_log_action(void) {
 
 static void advanced_tools_menu(void) {
   int sub_selected = 0;
-  const int sub_items = 6;
+  const int sub_items = 5;
 
   while (1) {
     scr_clear();
@@ -1493,14 +1073,12 @@ static void advanced_tools_menu(void) {
                (sub_selected == 0) ? "->" : "  ");
     scr_printf(" %s [2] Restore NVRAM from Backup Buffer\n",
                (sub_selected == 1) ? "->" : "  ");
-    scr_printf(" %s [3] Config Overflow Quick Probe (Diagnostic)\n",
+    scr_printf(" %s [3] Restore NVRAM from USB File (NVRAM.BIN)\n",
                (sub_selected == 2) ? "->" : "  ");
-    scr_printf(" %s [4] EEPROM Worker Discovery & Flush Diagnostics\n",
+    scr_printf(" %s [4] Export Debug Log to USB Storage\n",
                (sub_selected == 3) ? "->" : "  ");
-    scr_printf(" %s [5] Export Debug Log to USB Storage\n",
+    scr_printf(" %s [5] Back to Main Menu\n\n",
                (sub_selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Back to Main Menu\n\n",
-               (sub_selected == 5) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     scr_printf(" NVRAM State : %s\n",
@@ -1526,15 +1104,12 @@ static void advanced_tools_menu(void) {
         restore_nvram_action();
         break;
       case 2:
-        probe_config_overflow_action();
+        restore_nvram_from_file_action();
         break;
       case 3:
-        worker_flush_diagnostics_action();
-        break;
-      case 4:
         save_debug_log_action();
         break;
-      case 5:
+      case 4:
         return;
       }
     } else if (btn & PAD_TRIANGLE) {
@@ -1557,17 +1132,11 @@ int main(int argc, char *argv[]) {
     if (!argv[i])
       continue;
     if (strcmp(argv[i], "--auto") == 0 || strcmp(argv[i], "--dump") == 0 || strcmp(argv[i], "--v1") == 0)
-      auto_action = 4;
-    else if (strcmp(argv[i], "--probe") == 0)
       auto_action = 3;
     else if (strcmp(argv[i], "--backup") == 0)
       auto_action = 2;
     else if (strcmp(argv[i], "--info") == 0 || strcmp(argv[i], "--ident") == 0)
       auto_action = 1;
-    else if (strcmp(argv[i], "--map") == 0)
-      auto_action = 5;
-    else if (strcmp(argv[i], "--flush") == 0)
-      auto_action = 6;
   }
 
   if (auto_action > 0) {
@@ -1587,21 +1156,12 @@ int main(int argc, char *argv[]) {
     backup_nvram_action();
     return 0;
   } else if (auto_action == 3) {
-    probe_config_overflow_action();
-    return 0;
-  } else if (auto_action == 4) {
     full_dump_and_verify_action();
-    return 0;
-  } else if (auto_action == 5) {
-    full_hardware_mapping_action();
-    return 0;
-  } else if (auto_action == 6) {
-    worker_flush_diagnostics_action();
     return 0;
   }
 
   int selected = 0;
-  const int menu_items = 5;
+  const int menu_items = 4;
 
   while (1) {
     scr_clear();
@@ -1625,19 +1185,17 @@ int main(int argc, char *argv[]) {
                (selected == 1) ? "->" : "  ");
     scr_printf("      -> View full console identity and save DEBUG_LOG.TXT to USB\n\n");
 
-    scr_printf(" %s [3] Full Hardware & RAM Mapping (All Regions)\n",
+    scr_printf(" %s [3] Advanced Tools & Manual Operations...\n",
                (selected == 2) ? "->" : "  ");
-    scr_printf("      -> Safe scan of Regions 0-7, RAM dumps & SCMD report\n\n");
+    scr_printf("      -> NVRAM backup, restore from memory or USB file\n\n");
 
-    scr_printf(" %s [4] Advanced Tools & Manual Operations...\n",
+    scr_printf(" %s [4] Exit to OSD / Browser\n\n",
                (selected == 3) ? "->" : "  ");
-    scr_printf("      -> Standalone NVRAM backup, restore, worker & flush probes\n\n");
-
-    scr_printf(" %s [5] Exit to OSD / Browser\n\n",
-               (selected == 4) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
-    if (g_storage_ready) {
+    if (g_mecha_ver[1] == 1) {
+      scr_printf(" [!] MechaCon v1.%02d detected - ROM dump NOT supported\n", g_mecha_ver[2]);
+    } else if (g_storage_ready) {
       scr_printf(" Status: Ready to dump to %s/\n", g_dump_dir);
     } else {
       scr_printf(" Status: %s/ [!] Insert USB flash drive (FAT32/exFAT)\n", g_dump_dir);
@@ -1665,12 +1223,9 @@ int main(int argc, char *argv[]) {
         show_system_info();
         break;
       case 2:
-        full_hardware_mapping_action();
-        break;
-      case 3:
         advanced_tools_menu();
         break;
-      case 4:
+      case 3:
         return 0;
       }
     }
