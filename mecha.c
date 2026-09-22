@@ -90,9 +90,10 @@ int mecha_read_ilink_id(u8 *out_ilink_id8, u8 *status) {
 // SCMD 0x17: Read Model Name (ASCII, 16 chars)
 // SCMD 0x17 with offset 0: out[0]=status, out[1..8]=first 8 chars
 // SCMD 0x17 with offset 8: out[0]=status, out[1..8]=second 8 chars
-int mecha_read_model_name(char *out_model16, u8 *status) {
-    if (!out_model16) return -1;
-    memset(out_model16, 0, 17);
+// out_model17 must point to at least 17 bytes (16 chars + NUL terminator).
+int mecha_read_model_name(char *out_model17, u8 *status) {
+    if (!out_model17) return -1;
+    memset(out_model17, 0, 17);
 
     u8 in[1] = { 0x00 };
     u8 out[16] = { 0 };
@@ -103,15 +104,15 @@ int mecha_read_model_name(char *out_model16, u8 *status) {
     if (ret != 1 || out[0] != 0x00) {
         return -1; // Unsupported on early consoles or not loaded
     }
-    memcpy(&out_model16[0], &out[1], 8);
+    memcpy(&out_model17[0], &out[1], 8);
 
     in[0] = 0x08;
     memset(out, 0, sizeof(out));
     ret = sceCdApplySCmd(0x17, in, 1, out);
     if (ret == 1 && out[0] == 0x00) {
-        memcpy(&out_model16[8], &out[1], 8);
+        memcpy(&out_model17[8], &out[1], 8);
     }
-    out_model16[16] = '\0';
+    out_model17[16] = '\0';
     return 0;
 }
 
@@ -140,6 +141,11 @@ int mecha_read_config(u8 *out16, u8 *status) {
 
     u8 err = 0;
     if (ret != 1) {
+        // Transport-level failure (audit M-3's "return value") is already the
+        // primary signal here; the payload-pattern check below only runs on
+        // top of it, requiring BOTH ret==1 status byte 0x80 AND all-zero tail
+        // before classifying as an error, to avoid misreading a legitimate
+        // {0x80, 0x00 x15} data block as an error packet.
         err = 0xFF;
     } else if (out[0] == 0x80) {
         // Check if remaining 15 bytes are all 0x00 (error packet signature)
@@ -293,13 +299,19 @@ int mecha_verify_nvram(const u8 *nvram_buf, ProgressCallback cb) {
     for (int w = 0; w < NVRAM_SIZE_WORDS; w++) {
         u16 current_word = 0;
         u8 status = 0;
-        mecha_read_nvm_word((u16)w, &current_word, &status);
+        int ret = mecha_read_nvm_word((u16)w, &current_word, &status);
 
-        u8 hi = (u8)((current_word >> 8) & 0xFF);
-        u8 lo = (u8)(current_word & 0xFF);
+        if (ret != 0 || status != 0x00) {
+            // Word could not be read back at all (current_word would read as 0).
+            // Skip the comparison instead of counting this as a data mismatch.
+            log_printf("[VERIFY_ERR] SCMD 0x0A failed at word %d (status 0x%02X); skipping comparison\n", w, status);
+        } else {
+            u8 hi = (u8)((current_word >> 8) & 0xFF);
+            u8 lo = (u8)(current_word & 0xFF);
 
-        if (nvram_buf[w * 2] != lo || nvram_buf[w * 2 + 1] != hi) {
-            mismatches++;
+            if (nvram_buf[w * 2] != lo || nvram_buf[w * 2 + 1] != hi) {
+                mismatches++;
+            }
         }
 
         if (cb && (w % 16 == 0 || w == NVRAM_SIZE_WORDS - 1)) {
@@ -811,7 +823,13 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
 
     // Step 1: Buffer the live 256B Config Region 2 window so all system state is preserved
     if (cb) cb(0, total_chunks, "Buffering config window...");
-    mecha_init_config_window();
+    if (mecha_init_config_window() != 0) {
+        // g_config_window would stay at its memset(0) state, which would make
+        // mecha_clean_overflow_ram()/prepare_stage_block() write zeroed blocks
+        // over live EEPROM config data (drive calibration, etc). Refuse instead.
+        log_printf("[EXPLOIT_ERR] Failed to buffer config window; refusing to touch EEPROM. Aborting dump.\n");
+        return -3;
+    }
 
     // Step 2: Detect active worker layout
     int active_layout = mecha_detect_worker_layout();
@@ -898,7 +916,10 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
                active_layout, total_chunks, total_rom_bytes / 1024);
 
     // Read staged chunk 0
-    mecha_read_staged_data(0, chunk_words, &rom_buf[0], NULL);
+    int read_err0 = mecha_read_staged_data(0, chunk_words, &rom_buf[0], NULL);
+    if (read_err0 > 0) {
+        log_printf("[READ_ERR] Chunk 0 readback had %d word errors; region left as 0xFF\n", read_err0);
+    }
 
     int consecutive_errors = 0;
 
@@ -928,7 +949,17 @@ int mecha_dump_full_rom(u8 *rom_buf, u32 *out_rom_size, const u8 *nvram_backup, 
         }
         consecutive_errors = 0;
 
-        mecha_read_staged_data(0, chunk_words, &rom_buf[buf_offset], NULL);
+        int read_err = mecha_read_staged_data(0, chunk_words, &rom_buf[buf_offset], NULL);
+        if (read_err > 0) {
+            log_printf("[READ_ERR] Chunk %d readback had %d word errors; region left as 0xFF\n", chunk, read_err);
+            consecutive_errors++;
+            if (consecutive_errors >= 5) {
+                log_printf("[EXPLOIT_ERR] 5 consecutive readback failures! Aborting dump and restoring NVRAM...\n");
+                mecha_restore_nvram(nvram_backup, NULL);
+                log_printf("[FAILSAFE] NVRAM restored after abort.\n");
+                return -101;
+            }
+        }
     }
 
     // Step 3: Always restore original EEPROM content from backup
@@ -985,11 +1016,13 @@ int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct 
 
     // On block 3, count reaches 0 -> firmware executes Config_Flush_To_NVRAM_Worker!
     // Wait for worker completion via delay + SCMD 0x40 polling
+    int flushed = 0;
     for (int r = 0; r < 200; r++) {
         u8 chk_st = 0xFF;
         mecha_open_config(0, region, 0, &chk_st);
         if (chk_st == 0x00) {
             mecha_close_config(&chk_st);
+            flushed = 1;
             break;
         }
         mecha_close_config(&chk_st);
@@ -997,6 +1030,11 @@ int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct 
     }
     mecha_close_config(&st);
     mecha_delay(5000);
+
+    if (!flushed) {
+        log_printf("[FLUSH_PROBE] Region %d worker flush timed out after 200 retries; results would be unreliable\n", region);
+        return -5;
+    }
 
     // Step 4: Immediately read post-flush RAM (256 bytes)
     int err2 = mecha_read_ram_probe_blocks(region, 16, 16, post_ram256, &st);

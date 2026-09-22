@@ -6,14 +6,19 @@
 #include <unistd.h>
 #include <sio.h>
 
-#define LOG_BUFFER_SIZE 65536
+// A full ROM dump with per-chunk logging can produce well over 64KB of log
+// text; the old 64KB cap silently dropped everything past it, including
+// restore-phase errors at the end of the run (see spc970-dumper audit L-4).
+#define LOG_BUFFER_SIZE (256 * 1024)
 
 static char s_log_buffer[LOG_BUFFER_SIZE];
 static int s_log_len = 0;
+static int s_log_truncated = 0;
 
 void log_init(void) {
     memset(s_log_buffer, 0, sizeof(s_log_buffer));
     s_log_len = 0;
+    s_log_truncated = 0;
     sio_init(115200, 0, 0, 0, 0);
     log_printf("\n=====================================================\n");
     log_printf("=== PS2 MechaCon Tool Debug Console Log Active    ===\n");
@@ -42,6 +47,13 @@ void log_printf(const char *fmt, ...) {
         memcpy(&s_log_buffer[s_log_len], msg, written);
         s_log_len += written;
         s_log_buffer[s_log_len] = '\0';
+    } else if (!s_log_truncated) {
+        // Buffer is full: leave a visible marker instead of silently dropping
+        // everything from here on (e.g. NVRAM restore results at dump end).
+        s_log_truncated = 1;
+        static const char marker[] = "\n[LOG_TRUNCATED] Buffer full - later entries were not saved to DEBUG_LOG.TXT\n";
+        sio_puts(marker);
+        printf("%s", marker);
     }
 }
 
