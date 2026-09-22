@@ -1075,3 +1075,102 @@ int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct 
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENTAL: extended write-reach probe.
+//
+// mecha_read_ram_probe_blocks() (the READ-mode SCMD 0x40/0x41 primitive) was
+// confirmed on real CXP101064 (v1.02) hardware to wrap back to block 0 after
+// 16 blocks (256 bytes) - requesting more blocks just re-reads the same 256
+// bytes, it does not walk further into RAM. That rules out "read further" as
+// a way to locate the v1 worker structure.
+//
+// The WRITE side (SCMD 0x40 write mode + SCMD 0x42) has only ever been probed
+// up to block 7 (probe_config_overflow_action()'s Step 3: "no bounds check"
+// on this chip up to that point) or used up to block 15 (mecha_exploit_stage_
+// chunk()'s hardcoded `index < 16` loop). Whether the write session ALSO
+// wraps at 256 bytes, or keeps accepting blocks further out, was unknown.
+// This answers that directly, and as safely as the primitive allows:
+//
+//   - Blocks 0-15 are rewritten verbatim from g_config_window (caller must
+//     have called mecha_init_config_window() first) so the already-understood
+//     region is left exactly as found.
+//   - Blocks 16..(16+max_extra_blocks-1) get an all-zero payload (checksum
+//     computed normally by mecha_write_config()). Zero is deliberate: it
+//     matches the "idle" convention mecha_clean_overflow_ram() already uses
+//     for blocks 8-15, minimizing the chance some written byte is misread as
+//     a live flag/trigger outside the 16 known blocks.
+//   - The worker trigger sequence (flags byte = 0x03) that mecha_exploit_
+//     stage_chunk() uses is NEVER written here, so the EEPROM-copy worker is
+//     never armed - this only characterizes how far SCMD 0x42 accepts writes,
+//     nothing here should ever reach EEPROM.
+//   - The loop stops at the first non-0x00 status (or transport failure), so
+//     it never pushes further than the hardware itself accepts.
+//
+// Returns the number of extra blocks (beyond block 15) accepted with status
+// 0x00, or a negative code if opening the session or rewriting the known-safe
+// blocks 0-15 failed. Callers should wrap this with the same NVRAM backup/
+// restore safety net as the real exploit even though no worker is armed here.
+int mecha_probe_extended_write_reach(u8 region, int max_extra_blocks, ProgressCallback cb) {
+    if (max_extra_blocks <= 0) return -1;
+    if (max_extra_blocks > 128) max_extra_blocks = 128; // sane upper bound
+
+    u8 status = 0;
+    int ret = mecha_open_config(1, region, 0, &status);
+    if (ret != 0) {
+        log_printf("[REACH_PROBE] SCMD 0x40 open (write, reg %d, count 0) failed: ret=%d, status=0x%02X\n",
+                   region, ret, status);
+        mecha_close_config(&status);
+        return -2;
+    }
+
+    // Blocks 0-15: rewrite verbatim from the buffered window (same convention
+    // as mecha_exploit_stage_chunk's Lap 1, minus the trigger byte).
+    for (int index = 0; index < 16; index++) {
+        u8 block[16];
+        memcpy(block, &g_config_window[index * 16], 16);
+        if (index == 7) {
+            block[0] = 0xFF;
+            if (block[1] == 0) block[1] = 0x67;
+        }
+        if (mecha_write_config_raw(block) != 0) {
+            log_printf("[REACH_PROBE] Block %d (known region) write failed - aborting before touching new territory\n", index);
+            mecha_close_config(&status);
+            return -3;
+        }
+        mecha_delay(200);
+    }
+
+    // Blocks 16+: neutral all-zero payload, one block at a time, stopping at
+    // the first rejection.
+    int accepted = 0;
+    for (int extra = 0; extra < max_extra_blocks; extra++) {
+        u8 block[16] = { 0 };
+        u8 wr_stat = 0xFF;
+        int wr_ret = mecha_write_config(block, &wr_stat);
+        int block_index = 16 + extra;
+        log_printf("[REACH_PROBE] Block %d (offset 0x%03X from buffer base): ret=%d stat=0x%02X\n",
+                   block_index, block_index * 16, wr_ret, wr_stat);
+        if (cb) cb(extra + 1, max_extra_blocks, "Probing extended write reach...");
+        if (wr_ret != 0 || wr_stat != 0x00) {
+            log_printf("[REACH_PROBE] Rejected at block %d (offset 0x%03X) - stopping, nothing further was written\n",
+                       block_index, block_index * 16);
+            break;
+        }
+        accepted++;
+        mecha_delay(200);
+    }
+
+    if (accepted == max_extra_blocks) {
+        log_printf("[REACH_PROBE] Still accepting writes at the requested limit (%d extra blocks) - reach may extend further\n",
+                   max_extra_blocks);
+    }
+
+    u8 close_stat = 0;
+    mecha_close_config(&close_stat);
+    log_printf("[REACH_PROBE] SCMD 0x43 close: stat=0x%02X. Extra blocks accepted past block 15: %d (0x%03X bytes)\n",
+               close_stat, accepted, accepted * 16);
+    mecha_delay(2000);
+
+    return accepted;
+}
+

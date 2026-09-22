@@ -1454,6 +1454,137 @@ static void worker_flush_diagnostics_action(void) {
   wait_for_cross();
 }
 
+// Menu: EXPERIMENTAL Extended Write-Reach Probe
+//
+// The known worker layouts (mecha.h/mecha.c) all land inside the first 16
+// blocks (256 bytes) past the Config Region buffer base, which is as far as
+// the real exploit (mecha_exploit_stage_chunk) and the read-only RAM probes
+// (mecha_read_ram_probe*) ever reach. On some chips (e.g. real CXP101064
+// v1.02/v1.03 hardware) none of those layouts land on anything live, and the
+// read-mode probe has been confirmed to wrap back to block 0 after 16 blocks
+// rather than walking further into RAM - so it can't be used to look deeper.
+//
+// This runs mecha_probe_extended_write_reach(), which never arms the EEPROM
+// worker, to find out whether the WRITE side also stops at block 15 or keeps
+// accepting blocks further out. Still touches live MechaCon RAM, so NVRAM is
+// backed up first and restored afterward exactly like every other action
+// here that opens a write-mode Config session.
+static void extended_write_reach_probe_action(void) {
+  scr_clear();
+  scr_printf("=====================================================\n");
+  scr_printf("   EXPERIMENTAL: Extended Write-Reach Probe          \n");
+  scr_printf("=====================================================\n\n");
+  scr_printf(" [!] This writes neutral (all-zero) blocks past the known\n");
+  scr_printf("     16-block window to see how far SCMD 0x42 accepts writes.\n");
+  scr_printf("     The EEPROM-copy worker is never armed by this probe.\n\n");
+
+  log_printf("[REACH_PROBE] Extended write-reach probe initiated...\n");
+
+  // Step 1: Ensure NVRAM backup exists
+  if (!g_nvram_backed_up) {
+    scr_printf(" [*] Step 1/3: Backing up NVRAM first for safety...\n");
+    int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
+    g_nvram_backed_up = (read_errs == 0);
+    if (read_errs > 0) {
+      log_printf("[WARN] NVRAM backup had %d word errors\n", read_errs);
+      scr_printf(" [!] NVRAM backup incomplete (%d errors). Aborting for safety.\n", read_errs);
+      wait_for_cross();
+      return;
+    }
+    g_serial = extract_serial_from_nvram(g_nvram_backup, &g_emcs);
+    g_model_id = extract_model_id_from_nvram(g_nvram_backup);
+    update_dump_directory();
+
+    char nvram_path[256];
+    snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
+    int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd_nvm >= 0) {
+      write_checked(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path);
+      close(fd_nvm);
+    }
+  } else {
+    scr_printf(" [*] Step 1/3: NVRAM is already safely backed up.\n");
+  }
+  update_dump_directory();
+
+  // Step 2: Buffer the live Config Region 2 window (blocks 0-15) so the probe
+  // can rewrite them verbatim before touching new territory.
+  scr_printf("\n [*] Step 2/3: Buffering live Config Region 2 window...\n");
+  if (mecha_init_config_window() != 0) {
+    scr_printf(" [-] Failed to buffer config window. Aborting - nothing was written.\n");
+    log_printf("[REACH_PROBE] Aborted: mecha_init_config_window() failed.\n");
+    wait_for_cross();
+    return;
+  }
+
+  // Step 3: Run the probe against Region 2, then Region 1 (map sweeps have
+  // shown a handful of non-zero overflow bytes in Region 1 on some v1 units).
+  scr_printf("\n [*] Step 3/3: Probing extended write reach (Region 2, then Region 1)...\n");
+  const int max_extra_blocks = 32; // 32*16 = 512 bytes past block 15
+  int accepted_r2 = mecha_probe_extended_write_reach(2, max_extra_blocks, draw_progress_bar);
+  scr_printf(" Region 2: ");
+  if (accepted_r2 < 0) {
+    scr_printf("probe setup failed (code %d)\n", accepted_r2);
+  } else {
+    scr_printf("%d extra blocks accepted (0x%03X bytes past block 15)\n",
+               accepted_r2, accepted_r2 * 16);
+  }
+
+  // Re-buffer before touching Region 1, since Region 1 has its own 16-block
+  // window and mecha_init_config_window() only ever reads Region 2.
+  u8 region1_window[256];
+  u8 r1_status = 0;
+  int r1_read = mecha_read_ram_probe(1, 16, region1_window, &r1_status);
+  int accepted_r1 = -9;
+  if (r1_read == 0 && r1_status == 0x00) {
+    memcpy(g_config_window, region1_window, 256);
+    accepted_r1 = mecha_probe_extended_write_reach(1, max_extra_blocks, draw_progress_bar);
+  } else {
+    log_printf("[REACH_PROBE] Skipping Region 1: baseline read failed (err=%d, stat=0x%02X)\n",
+               r1_read, r1_status);
+  }
+  scr_printf(" Region 1: ");
+  if (accepted_r1 < 0) {
+    scr_printf("skipped/failed (code %d)\n", accepted_r1);
+  } else {
+    scr_printf("%d extra blocks accepted (0x%03X bytes past block 15)\n",
+               accepted_r1, accepted_r1 * 16);
+  }
+
+  // Always restore NVRAM and clean overflow RAM afterward, exactly like every
+  // other action that opens a write-mode Config session.
+  scr_printf("\n [*] Restoring NVRAM and cleaning overflow RAM...\n");
+  int rest_err = mecha_restore_nvram(g_nvram_backup, draw_progress_bar);
+  mecha_clean_overflow_ram();
+  log_printf("[REACH_PROBE] Post-probe NVRAM restore: %d errors\n", rest_err);
+
+  // Save a small report
+  update_dump_directory();
+  char rpt_path[256];
+  snprintf(rpt_path, sizeof(rpt_path), "%s/WRITE_REACH_PROBE.TXT", g_dump_dir);
+  FILE *fr = fopen(rpt_path, "w");
+  if (fr) {
+    fprintf(fr, "=== Extended Write-Reach Probe (EXPERIMENTAL) ===\n");
+    fprintf(fr, "MechaCon: v%d.%02d (Reg 0x%02X, Rev 0x%02X) | Chip: %s\n\n",
+            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], g_mecha_ver[3],
+            get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
+    fprintf(fr, "Region 2: extra blocks accepted past block 15 = %d (0x%03X bytes)\n",
+            accepted_r2, accepted_r2 < 0 ? 0 : accepted_r2 * 16);
+    fprintf(fr, "Region 1: extra blocks accepted past block 15 = %d (0x%03X bytes)\n",
+            accepted_r1, accepted_r1 < 0 ? 0 : accepted_r1 * 16);
+    fprintf(fr, "\nSee DEBUG_LOG.TXT [REACH_PROBE] lines for the per-block status trace.\n");
+    fclose(fr);
+    scr_printf(" [+] Saved: %s\n", rpt_path);
+  }
+
+  char log_path[256];
+  snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
+  log_save_to_file(log_path);
+
+  scr_printf("\n [+] Probe complete! All files saved to:\n    %s/\n", g_dump_dir);
+  wait_for_cross();
+}
+
 // Menu 7: Save Debug Log to USB
 static void save_debug_log_action(void) {
   scr_clear();
@@ -1480,7 +1611,7 @@ static void save_debug_log_action(void) {
 
 static void advanced_tools_menu(void) {
   int sub_selected = 0;
-  const int sub_items = 6;
+  const int sub_items = 7;
 
   while (1) {
     scr_clear();
@@ -1497,10 +1628,12 @@ static void advanced_tools_menu(void) {
                (sub_selected == 2) ? "->" : "  ");
     scr_printf(" %s [4] EEPROM Worker Discovery & Flush Diagnostics\n",
                (sub_selected == 3) ? "->" : "  ");
-    scr_printf(" %s [5] Export Debug Log to USB Storage\n",
+    scr_printf(" %s [5] Extended Write-Reach Probe (EXPERIMENTAL)\n",
                (sub_selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Back to Main Menu\n\n",
+    scr_printf(" %s [6] Export Debug Log to USB Storage\n",
                (sub_selected == 5) ? "->" : "  ");
+    scr_printf(" %s [7] Back to Main Menu\n\n",
+               (sub_selected == 6) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     scr_printf(" NVRAM State : %s\n",
@@ -1532,9 +1665,12 @@ static void advanced_tools_menu(void) {
         worker_flush_diagnostics_action();
         break;
       case 4:
-        save_debug_log_action();
+        extended_write_reach_probe_action();
         break;
       case 5:
+        save_debug_log_action();
+        break;
+      case 6:
         return;
       }
     } else if (btn & PAD_TRIANGLE) {

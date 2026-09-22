@@ -177,4 +177,12 @@ struct worker_flush_diff {
 // Perform a safe hardware-native 4-block flush to observe MechaCon internal worker pointers
 int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct worker_flush_diff *diff);
 
+// EXPERIMENTAL: probe how many blocks past the known 16-block (256-byte)
+// Config Region window SCMD 0x42 will still accept a write to, using neutral
+// all-zero blocks and never arming the EEPROM-copy worker. Caller must call
+// mecha_init_config_window() first. Returns the number of extra blocks
+// (beyond block 15) accepted with status 0x00, or a negative code on setup
+// failure. See mecha.c for the full safety rationale.
+int mecha_probe_extended_write_reach(u8 region, int max_extra_blocks, ProgressCallback cb);
+
 #endif // MECHA_H
