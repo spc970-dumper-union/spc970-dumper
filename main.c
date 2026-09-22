@@ -1585,6 +1585,136 @@ static void extended_write_reach_probe_action(void) {
   wait_for_cross();
 }
 
+// Menu: EXPERIMENTAL Deep Worker Candidate Scan
+//
+// Only meaningful after Extended Write-Reach Probe has confirmed writes are
+// accepted at least up to the requested range here. Unlike that probe, this
+// one DOES arm and trigger the EEPROM-copy worker on each candidate (that's
+// the only way to tell whether a candidate position is real) - the safety
+// net is that NVRAM is restored immediately after every single candidate,
+// hit or not, before the next one runs. See mecha_scan_deep_worker_candidates()
+// in mecha.c for the full rationale.
+static void deep_worker_scan_action(void) {
+  scr_clear();
+  scr_printf("=====================================================\n");
+  scr_printf("   EXPERIMENTAL: Deep Worker Candidate Scan          \n");
+  scr_printf("=====================================================\n\n");
+  scr_printf(" [!] This ARMS and TRIGGERS the EEPROM worker at each candidate\n");
+  scr_printf("     block, unlike the write-reach probe. NVRAM is restored\n");
+  scr_printf("     after every single candidate, hit or not.\n");
+  scr_printf(" [!] Only run this after Extended Write-Reach Probe confirmed\n");
+  scr_printf("     writes are accepted at least this far out.\n\n");
+
+  log_printf("[DEEP_SCAN] Deep worker candidate scan initiated...\n");
+
+  // Step 1: Ensure NVRAM backup exists
+  if (!g_nvram_backed_up) {
+    scr_printf(" [*] Step 1/3: Backing up NVRAM first for safety...\n");
+    int read_errs = mecha_backup_nvram(g_nvram_backup, draw_progress_bar);
+    g_nvram_backed_up = (read_errs == 0);
+    if (read_errs > 0) {
+      log_printf("[WARN] NVRAM backup had %d word errors\n", read_errs);
+      scr_printf(" [!] NVRAM backup incomplete (%d errors). Aborting for safety.\n", read_errs);
+      wait_for_cross();
+      return;
+    }
+    g_serial = extract_serial_from_nvram(g_nvram_backup, &g_emcs);
+    g_model_id = extract_model_id_from_nvram(g_nvram_backup);
+    update_dump_directory();
+
+    char nvram_path[256];
+    snprintf(nvram_path, sizeof(nvram_path), "%s/NVRAM.BIN", g_dump_dir);
+    int fd_nvm = open(nvram_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (fd_nvm >= 0) {
+      write_checked(fd_nvm, g_nvram_backup, NVRAM_SIZE_BYTES, nvram_path);
+      close(fd_nvm);
+    }
+  } else {
+    scr_printf(" [*] Step 1/3: NVRAM is already safely backed up.\n");
+  }
+  update_dump_directory();
+
+  // Step 2: Buffer the live Config Region 2 window (blocks 0-15)
+  scr_printf("\n [*] Step 2/3: Buffering live Config Region 2 window...\n");
+  if (mecha_init_config_window() != 0) {
+    scr_printf(" [-] Failed to buffer config window. Aborting - nothing was written.\n");
+    log_printf("[DEEP_SCAN] Aborted: mecha_init_config_window() failed.\n");
+    wait_for_cross();
+    return;
+  }
+
+  // Step 3: Run the scan. Range chosen to bracket the estimated target
+  // offset with margin, while staying well inside the ~32-block reach
+  // already confirmed accepted on this chip.
+  const int first_block = 16;
+  const int last_block = 27; // covers offsets 0x100-0x1BF (256-447 bytes past base)
+  const u32 rom_test_addr = (g_mecha_ver[1] >= 3) ? 0xFD0000 : 0xFC0000;
+
+  scr_printf("\n [*] Step 3/3: Scanning blocks %d-%d (offsets 0x%03X-0x%03X)...\n",
+             first_block, last_block, first_block * 16, last_block * 16);
+  u16 preview[8] = { 0 };
+  int hit_block = mecha_scan_deep_worker_candidates(rom_test_addr, first_block, last_block,
+                                                      g_nvram_backup, preview, draw_progress_bar);
+
+  if (hit_block >= 0) {
+    scr_printf("\n [+][+][+] HIT at block %d (offset 0x%03X)! [+][+][+]\n", hit_block, hit_block * 16);
+    scr_printf("     Preview: %04X %04X %04X %04X %04X %04X %04X %04X\n",
+               preview[0], preview[1], preview[2], preview[3],
+               preview[4], preview[5], preview[6], preview[7]);
+    log_printf("[DEEP_SCAN] Result: HIT at block %d (offset 0x%03X)\n", hit_block, hit_block * 16);
+  } else {
+    scr_printf("\n [-] No hit in blocks %d-%d. See DEBUG_LOG.TXT [DEEP_SCAN] lines\n", first_block, last_block);
+    scr_printf("     for the per-candidate preview trace (widen the range and retry).\n");
+    log_printf("[DEEP_SCAN] Result: no hit in blocks %d-%d\n", first_block, last_block);
+  }
+
+  // Belt-and-suspenders: the scan already restores after every candidate,
+  // but confirm/re-settle NVRAM state once more before returning to the menu.
+  scr_printf("\n [*] Confirming NVRAM restore and cleaning overflow RAM...\n");
+  int rest_err = mecha_restore_nvram(g_nvram_backup, draw_progress_bar);
+  mecha_clean_overflow_ram();
+  int mismatches = mecha_verify_nvram(g_nvram_backup, draw_progress_bar);
+  log_printf("[DEEP_SCAN] Final NVRAM restore: %d errors, %d mismatches\n", rest_err, mismatches);
+  if (mismatches == 0) {
+    scr_printf(" [+] NVRAM confirmed 100%% restored.\n");
+  } else {
+    scr_printf(" [!] WARNING: %d word mismatches after restore - check DEBUG_LOG.TXT!\n", mismatches);
+  }
+
+  // Save a report
+  update_dump_directory();
+  char rpt_path[256];
+  snprintf(rpt_path, sizeof(rpt_path), "%s/DEEP_SCAN_REPORT.TXT", g_dump_dir);
+  FILE *fr = fopen(rpt_path, "w");
+  if (fr) {
+    fprintf(fr, "=== Deep Worker Candidate Scan (EXPERIMENTAL) ===\n");
+    fprintf(fr, "MechaCon: v%d.%02d (Reg 0x%02X, Rev 0x%02X) | Chip: %s\n\n",
+            g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0], g_mecha_ver[3],
+            get_mechacon_chip_desc(g_mecha_ver[1], g_mecha_ver[2], g_mecha_ver[0]));
+    fprintf(fr, "Scanned blocks %d-%d (offsets 0x%03X-0x%03X) at ROM test addr 0x%06X\n",
+            first_block, last_block, first_block * 16, last_block * 16, (unsigned)rom_test_addr);
+    if (hit_block >= 0) {
+      fprintf(fr, "\nHIT at block %d (offset 0x%03X)\n", hit_block, hit_block * 16);
+      fprintf(fr, "Preview words 0-7: %04X %04X %04X %04X %04X %04X %04X %04X\n",
+              preview[0], preview[1], preview[2], preview[3],
+              preview[4], preview[5], preview[6], preview[7]);
+    } else {
+      fprintf(fr, "\nNo hit in range.\n");
+    }
+    fprintf(fr, "Post-scan NVRAM restore: %d errors, %d mismatches\n", rest_err, mismatches);
+    fprintf(fr, "\nSee DEBUG_LOG.TXT [DEEP_SCAN] lines for the full per-candidate trace.\n");
+    fclose(fr);
+    scr_printf(" [+] Saved: %s\n", rpt_path);
+  }
+
+  char log_path[256];
+  snprintf(log_path, sizeof(log_path), "%s/DEBUG_LOG.TXT", g_dump_dir);
+  log_save_to_file(log_path);
+
+  scr_printf("\n [+] Scan complete! All files saved to:\n    %s/\n", g_dump_dir);
+  wait_for_cross();
+}
+
 // Menu 7: Save Debug Log to USB
 static void save_debug_log_action(void) {
   scr_clear();
@@ -1611,7 +1741,7 @@ static void save_debug_log_action(void) {
 
 static void advanced_tools_menu(void) {
   int sub_selected = 0;
-  const int sub_items = 7;
+  const int sub_items = 8;
 
   while (1) {
     scr_clear();
@@ -1630,10 +1760,12 @@ static void advanced_tools_menu(void) {
                (sub_selected == 3) ? "->" : "  ");
     scr_printf(" %s [5] Extended Write-Reach Probe (EXPERIMENTAL)\n",
                (sub_selected == 4) ? "->" : "  ");
-    scr_printf(" %s [6] Export Debug Log to USB Storage\n",
+    scr_printf(" %s [6] Deep Worker Candidate Scan (EXPERIMENTAL)\n",
                (sub_selected == 5) ? "->" : "  ");
-    scr_printf(" %s [7] Back to Main Menu\n\n",
+    scr_printf(" %s [7] Export Debug Log to USB Storage\n",
                (sub_selected == 6) ? "->" : "  ");
+    scr_printf(" %s [8] Back to Main Menu\n\n",
+               (sub_selected == 7) ? "->" : "  ");
 
     scr_printf("-----------------------------------------------------\n");
     scr_printf(" NVRAM State : %s\n",
@@ -1668,9 +1800,12 @@ static void advanced_tools_menu(void) {
         extended_write_reach_probe_action();
         break;
       case 5:
-        save_debug_log_action();
+        deep_worker_scan_action();
         break;
       case 6:
+        save_debug_log_action();
+        break;
+      case 7:
         return;
       }
     } else if (btn & PAD_TRIANGLE) {

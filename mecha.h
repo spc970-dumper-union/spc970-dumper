@@ -185,4 +185,19 @@ int mecha_worker_flush_probe(u8 region, u8 *pre_ram256, u8 *post_ram256, struct 
 // failure. See mecha.c for the full safety rationale.
 int mecha_probe_extended_write_reach(u8 region, int max_extra_blocks, ProgressCallback cb);
 
+// EXPERIMENTAL: sweep candidate block positions (>=16) past the known window
+// for a compact worker struct using the same field pattern as
+// LAYOUT_V1_CXP101064/LAYOUT_EARLY_CXP102064, arming and triggering each one
+// and checking NVRAM words 0-7 for a ROM-signature/changed preview. Restores
+// NVRAM after every candidate regardless of outcome. Caller must call
+// mecha_init_config_window() first, and should only run this after
+// mecha_probe_extended_write_reach() has confirmed writes are accepted at
+// least up to last_trial_block+1. Returns the winning block index (>=16) on
+// a hit (out_preview_words, if non-NULL, receives the matching 8 preview
+// words), or -1 if no candidate in range produced a plausible signature. See
+// mecha.c for the full safety rationale.
+int mecha_scan_deep_worker_candidates(u32 rom_test_addr, int first_trial_block, int last_trial_block,
+                                       const u8 *nvram_backup, u16 out_preview_words[8],
+                                       ProgressCallback cb);
+
 #endif // MECHA_H

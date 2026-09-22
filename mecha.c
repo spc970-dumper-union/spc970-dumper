@@ -1174,3 +1174,244 @@ int mecha_probe_extended_write_reach(u8 region, int max_extra_blocks, ProgressCa
     return accepted;
 }
 
+// ---------------------------------------------------------------------------
+// EXPERIMENTAL: deep worker candidate scan.
+//
+// mecha_probe_extended_write_reach() confirmed real CXP101064 (v1.02)
+// hardware accepts SCMD 0x42 writes at least ~32 blocks (512 bytes) past the
+// known 16-block window, with no rejection observed. This sweeps candidate
+// block positions in that now-confirmed-reachable zone for a worker struct
+// using the SAME compact single-block(+spillover) field pattern already
+// proven on CXP102064 chips by LAYOUT_V1_CXP101064/LAYOUT_EARLY_CXP102064
+// (flags@byte12, ROM-pointer LSB@byte14 + mid-byte via checksum, ROM-pointer
+// high bytes@(block+1) bytes0-1, word_count@byte3, worker_state@byte4,
+// destination NVRAM word@byte6-7) - just relocated to a different block,
+// on the theory the same C struct simply landed at a different offset in
+// this older firmware build.
+//
+// For each candidate block:
+//   - Blocks 0-15 are rewritten verbatim from g_config_window; every other
+//     block up to the candidate (and its spillover block) gets the same
+//     neutral all-zero payload mecha_probe_extended_write_reach() already
+//     validated as accepted and inert.
+//   - The candidate's fields are armed (idle flags) via the same two-lap
+//     protocol mecha_exploit_stage_chunk() uses, then triggered (flags=0x03)
+//     exactly like the real exploit.
+//   - NVRAM words 0-7 are read back via SCMD 0x0A and compared against the
+//     pre-existing baseline using the same signature checks
+//     mecha_dump_full_rom() uses for its own pre-flight validation.
+//   - NVRAM is restored from nvram_backup after EVERY candidate, hit or not,
+//     before moving on - never accumulates risk across candidates.
+//
+// Returns the block index (>=16) of the first candidate whose trigger
+// produced a plausible ROM-signature/changed preview, or -1 if none of the
+// candidates in [first_trial_block, last_trial_block] did. On a hit,
+// out_preview_words (if non-NULL) receives the 8 preview words that matched.
+static void deep_scan_block_base(int index, u8 out16[16]) {
+    if (index < 16) {
+        memcpy(out16, &g_config_window[index * 16], 16);
+        if (index == 7) {
+            out16[0] = 0xFF;
+            if (out16[1] == 0) out16[1] = 0x67;
+        }
+    } else {
+        memset(out16, 0, 16);
+    }
+}
+
+// Same overlay math as prepare_stage_block(), but sourcing the "before
+// overlay" 16 bytes from deep_scan_block_base() so it stays safe for block
+// indices past g_config_window's 256-byte (16-block) size.
+static void prepare_deep_scan_block(int index, u32 rom_address, u16 nvram_word,
+                                     int word_count, const struct worker_layout *layout,
+                                     u8 block[16]) {
+    deep_scan_block_base(index, block);
+
+    if (index == layout->flags_block) {
+        block[layout->flags_byte] &= 0xFC; // Idle mask
+        if (layout->source_pointer_offset <= 12) {
+            block[layout->source_pointer_offset]     = (u8)(rom_address & 0xFF);
+            block[layout->source_pointer_offset + 1] = (u8)((rom_address >> 8) & 0xFF);
+            block[layout->source_pointer_offset + 2] = (u8)((rom_address >> 16) & 0xFF);
+            block[layout->source_pointer_offset + 3] = (u8)((rom_address >> 24) & 0xFF);
+        } else {
+            block[layout->source_pointer_offset] = (u8)(rom_address & 0xFF);
+            if (layout->checksum_adjust_byte < 15) {
+                block[layout->checksum_adjust_byte] = 0;
+                u8 partial_sum = 0;
+                for (int i = 0; i < 15; i++) partial_sum += block[i];
+                block[layout->checksum_adjust_byte] = (u8)(((u8)((rom_address >> 8) & 0xFF)) - partial_sum);
+            }
+        }
+    }
+
+    if (layout->source_pointer_offset > 12 && index == (layout->flags_block + 1)) {
+        block[0] = (u8)((rom_address >> 16) & 0xFF);
+        block[1] = (u8)((rom_address >> 24) & 0xFF);
+    }
+
+    if (index == layout->control_block) {
+        block[layout->source_offset_byte] = 0;
+        block[layout->word_count_byte] = (u8)word_count;
+        block[layout->worker_state_byte] = 1; // Armed
+    }
+
+    if (index == layout->destination_block) {
+        block[layout->destination_low_byte] = (u8)(nvram_word & 0xFF);
+        if (layout->destination_high_byte < 15) {
+            block[layout->destination_high_byte] = (u8)((nvram_word >> 8) & 0xFF);
+        } else {
+            block[layout->checksum_adjust_byte] = 0;
+            u8 partial_sum = 0;
+            for (int i = 0; i < 15; i++) partial_sum += block[i];
+            block[layout->checksum_adjust_byte] = (u8)(((u8)(nvram_word >> 8)) - partial_sum);
+        }
+    }
+
+    u8 sum = 0;
+    for (int i = 0; i < 15; i++) sum += block[i];
+    block[15] = sum;
+}
+
+int mecha_scan_deep_worker_candidates(u32 rom_test_addr, int first_trial_block, int last_trial_block,
+                                       const u8 *nvram_backup, u16 out_preview_words[8],
+                                       ProgressCallback cb) {
+    if (!nvram_backup) return -1;
+    if (first_trial_block < 16) first_trial_block = 16;
+    if (last_trial_block < first_trial_block) return -1;
+
+    u16 orig_w0 = (u16)(nvram_backup[0] | (nvram_backup[1] << 8));
+    u16 orig_w1 = (u16)(nvram_backup[2] | (nvram_backup[3] << 8));
+
+    int candidates = last_trial_block - first_trial_block + 1;
+    int tried = 0;
+
+    for (int tb = first_trial_block; tb <= last_trial_block; tb++) {
+        tried++;
+        if (cb) cb(tried, candidates, "Scanning deep worker candidates...");
+
+        struct worker_layout candidate = known_worker_layouts[LAYOUT_V1_CXP101064];
+        candidate.flags_block = (u8)tb;
+        candidate.control_block = (u8)tb;
+        candidate.destination_block = (u8)tb;
+
+        int total_blocks = tb + 2; // covers the pointer-high-byte spillover block
+
+        u8 status = 0;
+        int ret = mecha_open_config(1, 2, 0, &status);
+        if (ret != 0) {
+            log_printf("[DEEP_SCAN] Block %d: SCMD 0x40 open failed (ret=%d stat=0x%02X) - skipping\n",
+                       tb, ret, status);
+            mecha_close_config(&status);
+            mecha_delay(5000);
+            continue;
+        }
+
+        u8 block[16];
+        int write_failed = 0;
+
+        // Lap 1: arm (idle flags) across the full candidate range
+        for (int index = 0; index < total_blocks; index++) {
+            prepare_deep_scan_block(index, rom_test_addr, 0, EXPLOIT_CHUNK_WORDS, &candidate, block);
+            if (mecha_write_config_raw(block) != 0) {
+                write_failed = 1;
+                log_printf("[DEEP_SCAN] Block %d: Lap 1 write failed at index %d\n", tb, index);
+                break;
+            }
+            mecha_delay(200);
+        }
+
+        // Lap 2: rewrite everything before the flags block again (same
+        // pattern mecha_exploit_stage_chunk uses)
+        if (!write_failed) {
+            for (int index = 0; index < tb; index++) {
+                deep_scan_block_base(index, block);
+                u8 sum = 0;
+                for (int i = 0; i < 15; i++) sum += block[i];
+                block[15] = sum;
+                if (mecha_write_config_raw(block) != 0) {
+                    write_failed = 1;
+                    log_printf("[DEEP_SCAN] Block %d: Lap 2 write failed at index %d\n", tb, index);
+                    break;
+                }
+                mecha_delay(200);
+            }
+        }
+
+        if (write_failed) {
+            mecha_close_config(&status);
+            mecha_delay(2000);
+            mecha_restore_nvram(nvram_backup, NULL);
+            continue;
+        }
+
+        // Trigger: re-send the flags block with bits 0-1 set (busy+pending)
+        prepare_deep_scan_block(tb, rom_test_addr, 0, EXPLOIT_CHUNK_WORDS, &candidate, block);
+        block[candidate.flags_byte] = (block[candidate.flags_byte] & 0xFC) | 0x03;
+        if (candidate.source_pointer_offset > 12 && candidate.checksum_adjust_byte < 15) {
+            block[candidate.checksum_adjust_byte] = 0;
+            u8 partial_sum = 0;
+            for (int i = 0; i < 15; i++) partial_sum += block[i];
+            block[candidate.checksum_adjust_byte] = (u8)(((u8)((rom_test_addr >> 8) & 0xFF)) - partial_sum);
+        }
+        u8 sum = 0;
+        for (int i = 0; i < 15; i++) sum += block[i];
+        block[15] = sum;
+
+        int trigger_ok = (mecha_write_config_raw(block) == 0);
+        if (!trigger_ok) {
+            log_printf("[DEEP_SCAN] Block %d: trigger write failed\n", tb);
+        }
+
+        // Poll close (same bounded retry loop as mecha_exploit_stage_chunk)
+        int close_done = 0;
+        u8 final_stat = 0xFF;
+        for (int retry = 0; retry < 1000; retry++) {
+            u8 close_stat = 0xFF;
+            mecha_close_config(&close_stat);
+            final_stat = close_stat;
+            if (close_stat == 0x00) { close_done = 1; break; }
+            if (close_stat != 0x01) break;
+            mecha_delay(5000);
+        }
+        mecha_delay(2000);
+
+        u16 preview[8] = { 0 };
+        for (int i = 0; i < 8; i++) {
+            u8 st = 0;
+            mecha_read_nvm_word((u16)i, &preview[i], &st);
+        }
+        log_printf("[DEEP_SCAN] Block %d (offset 0x%03X): trigger_ok=%d close_stat=0x%02X "
+                   "preview=%04X %04X %04X %04X %04X %04X %04X %04X\n",
+                   tb, tb * 16, trigger_ok, final_stat,
+                   preview[0], preview[1], preview[2], preview[3],
+                   preview[4], preview[5], preview[6], preview[7]);
+
+        int hit = 0;
+        if (trigger_ok && close_done) {
+            if (preview[0] == 0x00E6 || preview[0] == 0xE600) {
+                hit = 1; // Standard SPC970 opcode signature
+            } else if (preview[0] == 0x76A6 || (preview[0] == 0x0000 && preview[1] == 0xA676)) {
+                hit = 1; // CXP103049 alternate signature
+            } else if ((preview[0] != orig_w0 || preview[1] != orig_w1) &&
+                       preview[1] != 0xFFFF && preview[0] != 0x0000) {
+                hit = 1; // Confirmed data transferred from ROM to NVRAM
+            }
+        }
+
+        // ALWAYS restore immediately, hit or not, before trying the next candidate
+        int rest_err = mecha_restore_nvram(nvram_backup, NULL);
+        if (rest_err != 0) {
+            log_printf("[DEEP_SCAN] Block %d: NVRAM restore had %d word errors\n", tb, rest_err);
+        }
+
+        if (hit) {
+            log_printf("[DEEP_SCAN] *** HIT at block %d (offset 0x%03X)! ***\n", tb, tb * 16);
+            if (out_preview_words) memcpy(out_preview_words, preview, sizeof(preview));
+            return tb;
+        }
+    }
+
+    return -1;
+}
+
