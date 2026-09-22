@@ -194,8 +194,13 @@ int mecha_probe_extended_write_reach(u8 region, int max_extra_blocks, ProgressCa
 // mecha_probe_extended_write_reach() has confirmed writes are accepted at
 // least up to last_trial_block+1. Returns the winning block index (>=16) on
 // a hit (out_preview_words, if non-NULL, receives the matching 8 preview
-// words), or -1 if no candidate in range produced a plausible signature. See
-// mecha.c for the full safety rationale.
+// words); -1 if every candidate in range was tried and none produced a
+// plausible signature; or -2 if the MechaCon's Config-session handshake got
+// wedged (SCMD 0x40 open stopped responding, observed after arming/
+// triggering a wrong candidate on real CXP101064 hardware) and the scan was
+// aborted early - in that case blocks above the one named in the log were
+// never actually tested, and the console should be power-cycled before
+// retrying. See mecha.c for the full safety rationale.
 int mecha_scan_deep_worker_candidates(u32 rom_test_addr, int first_trial_block, int last_trial_block,
                                        const u8 *nvram_backup, u16 out_preview_words[8],
                                        ProgressCallback cb);

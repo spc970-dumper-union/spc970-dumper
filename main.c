@@ -1662,6 +1662,12 @@ static void deep_worker_scan_action(void) {
                preview[0], preview[1], preview[2], preview[3],
                preview[4], preview[5], preview[6], preview[7]);
     log_printf("[DEEP_SCAN] Result: HIT at block %d (offset 0x%03X)\n", hit_block, hit_block * 16);
+  } else if (hit_block == -2) {
+    scr_printf("\n [!] MechaCon Config-session got wedged mid-scan - NOT all of\n");
+    scr_printf("     blocks %d-%d were actually tested (see log for which one).\n", first_block, last_block);
+    scr_printf("     NVRAM itself is fine (restored below), but you should\n");
+    scr_printf("     POWER-CYCLE the console before running this again.\n");
+    log_printf("[DEEP_SCAN] Result: ABORTED EARLY (wedged) - range %d-%d incomplete\n", first_block, last_block);
   } else {
     scr_printf("\n [-] No hit in blocks %d-%d. See DEBUG_LOG.TXT [DEEP_SCAN] lines\n", first_block, last_block);
     scr_printf("     for the per-candidate preview trace (widen the range and retry).\n");
@@ -1698,8 +1704,13 @@ static void deep_worker_scan_action(void) {
       fprintf(fr, "Preview words 0-7: %04X %04X %04X %04X %04X %04X %04X %04X\n",
               preview[0], preview[1], preview[2], preview[3],
               preview[4], preview[5], preview[6], preview[7]);
+    } else if (hit_block == -2) {
+      fprintf(fr, "\nABORTED EARLY: MechaCon Config-session got wedged mid-scan.\n");
+      fprintf(fr, "Not all blocks in %d-%d were tested - see DEBUG_LOG.TXT [DEEP_SCAN]\n", first_block, last_block);
+      fprintf(fr, "for the last block that was actually attempted. Power-cycle the\n");
+      fprintf(fr, "console before running this scan again.\n");
     } else {
-      fprintf(fr, "\nNo hit in range.\n");
+      fprintf(fr, "\nNo hit in range (all blocks %d-%d were tested).\n", first_block, last_block);
     }
     fprintf(fr, "Post-scan NVRAM restore: %d errors, %d mismatches\n", rest_err, mismatches);
     fprintf(fr, "\nSee DEBUG_LOG.TXT [DEEP_SCAN] lines for the full per-candidate trace.\n");

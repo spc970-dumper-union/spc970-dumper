@@ -1297,14 +1297,32 @@ int mecha_scan_deep_worker_candidates(u32 rom_test_addr, int first_trial_block, 
 
         int total_blocks = tb + 2; // covers the pointer-high-byte spillover block
 
+        // Arming+triggering a wrong candidate (unlike the all-zero write-reach
+        // probe) has been observed on real CXP101064 hardware to leave the
+        // Config-session handshake rejecting SCMD 0x40 open with stat=0x80 for
+        // every subsequent attempt - a short single retry does not recover it.
+        // Retry with real backoff; if it still won't open, the MechaCon is
+        // wedged and burning through the remaining candidates would only
+        // produce false "no hit" data for blocks that were never actually
+        // tested, so abort the whole scan instead of continuing silently.
         u8 status = 0;
-        int ret = mecha_open_config(1, 2, 0, &status);
-        if (ret != 0) {
-            log_printf("[DEEP_SCAN] Block %d: SCMD 0x40 open failed (ret=%d stat=0x%02X) - skipping\n",
-                       tb, ret, status);
+        int ret = -1;
+        int open_attempt;
+        for (open_attempt = 0; open_attempt < 20; open_attempt++) {
+            ret = mecha_open_config(1, 2, 0, &status);
+            if (ret == 0) break;
             mecha_close_config(&status);
-            mecha_delay(5000);
-            continue;
+            mecha_delay(20000);
+        }
+        if (ret != 0) {
+            log_printf("[DEEP_SCAN] Block %d: SCMD 0x40 open failed after %d retries (stat=0x%02X) - "
+                       "MechaCon appears wedged. Aborting scan: blocks %d-%d were NOT tested. "
+                       "Power-cycle the console before retrying.\n",
+                       tb, open_attempt, status, tb, last_trial_block);
+            return -2; // distinct from -1 ("no hit"): scan was cut short, range is incomplete
+        }
+        if (open_attempt > 0) {
+            log_printf("[DEEP_SCAN] Block %d: SCMD 0x40 open recovered after %d retries\n", tb, open_attempt);
         }
 
         u8 block[16];
